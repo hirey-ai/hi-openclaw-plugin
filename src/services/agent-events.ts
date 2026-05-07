@@ -145,9 +145,32 @@ export function buildAgentEventsService(config: Required<HiOpenClawPluginConfig>
         timer = setTimeout(tick, delayMs);
       };
 
-      void tick();
+      // PROBE: 二分定位 OOM —— 'first-only' 表示跑一次 tick 但不 schedule loop。
+      // 能区分 OOM 来自 service register/first-tick 还是 tick 循环累积。
+      const TICK_MODE = 'first-only' as 'normal' | 'first-only' | 'disabled';
+      if ((TICK_MODE as string) === 'normal') {
+        void tick();
+      } else if ((TICK_MODE as string) === 'first-only') {
+        const onceTick = async () => {
+          if (stopped) return;
+          try {
+            const auth = await ensureClients();
+            if (!auth) return;
+            const claim = await auth.gateway.claimEvents({ limit: 20, lease_ms: config.claimLeaseMs } as any);
+            const items = (claim?.items || []) as any[];
+            for (const ev of items) {
+              try { pushEventToQueue(ev as Record<string, unknown>); } catch { /* swallow */ }
+            }
+          } catch { /* swallow */ }
+        };
+        void onceTick();
+      }
+      // 抑制 unused warning：normal 模式下我们要保留 scheduleNext 跟 tick 引用
+      void scheduleNext;
+      void tick;
       logger.info?.('[hi-openclaw-plugin] agent-events service started', {
         webhook_loopback: config.webhookPath,
+        tick_mode: TICK_MODE,
       });
     },
     async stop(ctx: PluginServiceContext) {

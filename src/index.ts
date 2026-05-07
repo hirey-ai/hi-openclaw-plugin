@@ -60,29 +60,15 @@ export default function registerHiOpenClawPlugin(api: PluginRegisterApi): void {
     logger.info?.('[hi-openclaw-plugin] registered tools', { count: allTools.length, names: allTools.map(t => t.name) });
   }
 
-  // ---- service ----
-  // 临时下掉 agent-events service 跟 webhook route 用来定位 gateway OOM 重启循环根因；
-  // 暂时让 plugin 只暴露 tools。如果禁掉 service+route gateway 不再每分钟崩，就证明
-  // 服务/路由代码里有泄漏或 long-poll 累积；如果还崩，就跟我们 plugin 无关，是 host 别的事。
-  // 用编译期 const flag 而不是 process.env 避免触发 install scanner 的 env+network 误报。
-  const ENABLE_BACKGROUND_SERVICES = false;
-  if (ENABLE_BACKGROUND_SERVICES && typeof api.registerService === 'function') {
+  // ---- service / route 二分定位 OOM ----
+  // 1.0.5 (service+route 都禁) gateway 稳定 6+ 分钟 → 凶手在 service or route。
+  // 1.0.6+ 新策略：service 注册但 tick 只跑一次（not loop）；route 注册。
+  // 如果还 OOM → 凶手在 register 本身或 first-tick；不 OOM → 是 tick 循环累积。
+  if (typeof api.registerService === 'function') {
     api.registerService(buildAgentEventsService(config));
-  } else if (!ENABLE_BACKGROUND_SERVICES) {
-    logger.info?.('[hi-openclaw-plugin] background services disabled (probe build) — tools only');
-  } else {
-    logger.warn?.(
-      '[hi-openclaw-plugin] host does not expose api.registerService; agent-events claim loop will not run. Upgrade OpenClaw to >=2026.4.23.',
-    );
   }
-
-  // ---- http route ----
-  if (ENABLE_BACKGROUND_SERVICES && typeof api.registerHttpRoute === 'function') {
+  if (typeof api.registerHttpRoute === 'function') {
     api.registerHttpRoute(buildWebhookRoute(config, logger));
-  } else if (ENABLE_BACKGROUND_SERVICES) {
-    logger.warn?.(
-      '[hi-openclaw-plugin] host does not expose api.registerHttpRoute; webhook ingress disabled. Upgrade OpenClaw to >=2026.4.23.',
-    );
   }
 
   logger.info?.(
