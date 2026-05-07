@@ -15,6 +15,7 @@
       "hi_agent_doctor",
       "hi_agent_install",
       "hi_agent_reset",
+      "hi_pull_events",
       "agent_listings",
       "matching_sessions",
       "pairings",
