@@ -2,7 +2,7 @@
 
 Hirey Hi as a **native OpenClaw plugin**. Registers Hi's tools, agent-events claim service, and webhook ingress directly inside the OpenClaw gateway process — zero independent daemons, no `mcp.servers.hi` indirection, and no per-run frozen tool inventory boundary.
 
-This is the OpenClaw 5.4+ first-class path, published to ClawHub as **`clawhub:hirey`** (ClawPack code-plugin) and to npm as **`hirey`**. OpenClaw 4.23 ~ 5.3 hosts cannot load this ClawPack format and must install the prod bundle plugin **`clawhub:hirey-compatible`** instead (zip + skill + scripts wrapping `@hirey-ai/mcp-server` + `@hirey-ai/agent-receiver`).
+This is the OpenClaw 5.2+ first-class path, published to ClawHub as **`clawhub:hirey`** (ClawPack code-plugin) and to npm as **`hirey`**. OpenClaw 4.23 ~ 5.1 hosts cannot load this ClawPack format and must install the prod bundle plugin **`clawhub:hirey-compatible`** instead (zip + skill + scripts wrapping `@hirey-ai/mcp-server` + `@hirey-ai/agent-receiver`). All OpenClaw 4.23+ hosts can install `clawhub:hirey-compatible` as a universal fallback.
 
 ## Why this exists
 
@@ -24,8 +24,8 @@ This native plugin replaces all of the above with three OpenClaw plugin SDK call
 
 | Path | Audience |
 |---|---|
-| `clawhub:hirey` (this package, ClawPack code-plugin) | OpenClaw **5.4+**. Best UX, in-process, no boundary friction. |
-| `clawhub:hirey-compatible` (prod bundle plugin from `hi-platform`, zip + skills + scripts) | OpenClaw **4.23 ~ 5.3**. Wraps `@hirey-ai/mcp-server` + `@hirey-ai/agent-receiver` because these hosts cannot load ClawPack. |
+| `clawhub:hirey` (this package, ClawPack code-plugin) | OpenClaw **5.2+**. Best UX, in-process, no boundary friction. |
+| `clawhub:hirey-compatible` (prod bundle plugin from `hi-platform`, zip + skills + scripts) | **All OpenClaw 4.23+ hosts**. Required for 4.23 ~ 5.1 (those hosts cannot load ClawPack); optional fallback for 5.2+ if the ClawPack install path has any issue. Wraps `@hirey-ai/mcp-server` + `@hirey-ai/agent-receiver`. |
 | `@hirey-ai/mcp-server` + `@hirey-ai/agent-receiver` (npm, raw) | Claude Desktop, Cursor, VS Code MCP, any other MCP host. Stable cross-host transport. Independent of OpenClaw. |
 
 Business logic (`@hirey-ai/agent-sdk`, `@hirey-ai/agent-contracts`) is fully shared; only the wiring layer differs.
@@ -34,9 +34,8 @@ Business logic (`@hirey-ai/agent-sdk`, `@hirey-ai/agent-contracts`) is fully sha
 
 | OpenClaw version | `clawhub:hirey` (ClawPack) | `clawhub:hirey-compatible` (bundle) | Notes |
 |---|---|---|---|
-| **2026.5.4+** | ✅ recommended | ✅ works but skips native plugin benefits | ClawPack first-class path |
-| **2026.5.2 ~ 2026.5.3** | ❌ ClawHub server doesn't expose fallback `sha256hash` + `files[]` metadata to old client | ✅ | bundle only |
-| **2026.4.23 ~ 2026.5.1** | ❌ runtime expects date-format `pluginApi`, rejects semantic `1.0` | ✅ | bundle only |
+| **2026.5.2+** | ✅ recommended (in-process) | ✅ works but skips native plugin benefits | ClawPack first-class path |
+| **2026.4.23 ~ 2026.5.1** | ❌ runtime expects date-format `pluginApi`, rejects semantic `1.0` | ✅ recommended | bundle is the only path |
 | **2026.4.14 ~ 2026.4.22** | ❌ same as above | ❌ install scanner flags `child_process` in installer mjs | unsupported; must upgrade OpenClaw |
 | **< 2026.4.14** | ❌ | ❌ | unsupported |
 
@@ -46,20 +45,20 @@ OpenClaw is a personal agent driven by natural language; the LLM picks which com
 
 ```
 Install Hirey AI on this OpenClaw host. First check `openclaw --version`:
-- If 2026.5.4 or higher, run `openclaw plugins install clawhub:hirey`.
-- Otherwise, run `openclaw plugins install clawhub:hirey-compatible --dangerously-force-unsafe-install`.
+- If 2026.5.2 or higher, run `openclaw plugins install clawhub:hirey`.
+- Otherwise (OpenClaw 2026.4.23 ~ 2026.5.1), run `openclaw plugins install clawhub:hirey-compatible --dangerously-force-unsafe-install`.
 The `--dangerously-force-unsafe-install` flag is required only for the bundle path: it is OpenClaw's own break-glass override that lets community bundles ship a setup-time `child_process` helper for `npm install` + `openclaw config set`. The ClawPack path is in-process and does not need the flag.
 After install, call hi_agent_install (don't fabricate an agent id). Report the real agent_id and hooks_ready status.
 ```
 
-Direct CLI for OpenClaw 5.4+ users:
+Direct CLI for OpenClaw 5.2+ users:
 
 ```bash
 openclaw plugins install clawhub:hirey
 openclaw gateway restart
 ```
 
-For OpenClaw 4.23 ~ 5.3 users (bundle path):
+For OpenClaw 4.23 ~ 5.1 users (bundle path), or any 5.2+ user who wants the bundle as a universal fallback:
 
 ```bash
 openclaw plugins install clawhub:hirey-compatible --dangerously-force-unsafe-install
@@ -78,7 +77,7 @@ npm run build
 npm pack    # emits hirey-<version>.tgz
 ```
 
-Use `openclaw plugins install -l <local-dir>` for local link-mode testing (only on OpenClaw 5.4+).
+Use `openclaw plugins install -l <local-dir>` for local link-mode testing (only on OpenClaw 5.2+).
 
 ## License
 
