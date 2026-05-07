@@ -1,13 +1,13 @@
 {
   "name": "hirey",
-  "version": "1.0.0",
+  "version": "1.0.2",
   "repository": {
     "type": "git",
     "url": "https://github.com/hirey-ai/hi-openclaw-plugin.git"
   },
   "homepage": "https://github.com/hirey-ai/hi-openclaw-plugin#readme",
   "license": "UNLICENSED",
-  "description": "Hirey Hi as a native OpenClaw plugin: registers Hi tools, the agent-events claim service, and webhook ingress directly inside the gateway process — zero independent daemons, no `mcp.servers.hi` indirection, no per-run frozen tool inventory boundary. Same business logic as @hirey/hi-mcp-server / @hirey/hi-agent-receiver, but wired through OpenClaw's native register(api) instead of stdio MCP + spawned daemon. For OpenClaw 5.x; pre-5.x users keep using the ClawHub bundle path.",
+  "description": "Hirey Hi as a native OpenClaw plugin: registers Hi tools, the agent-events claim service, and webhook ingress directly inside the gateway process \u2014 zero independent daemons, no `mcp.servers.hi` indirection, no per-run frozen tool inventory boundary. Same business logic as @hirey/hi-mcp-server / @hirey/hi-agent-receiver, but wired through OpenClaw's native register(api) instead of stdio MCP + spawned daemon. For OpenClaw 5.x; pre-5.x users keep using the ClawHub bundle path.",
   "private": false,
   "type": "module",
   "main": "dist/index.js",

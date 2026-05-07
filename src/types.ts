@@ -24,15 +24,24 @@ export type PluginToolResult = {
   isError?: boolean;
 };
 
+// OpenClaw SDK 约定的 tool execute 签名是 4 个参数：(toolCallId, params, signal, onUpdate)，
+// 后两个是可选的（当前实现都不依赖，但保留入参 forward-compat）。
 export type PluginToolDefinition = {
   name: string;
   label?: string;
   description: string;
   parameters: PluginToolParameterSchema;
-  execute: (toolCallId: string, params: unknown) => Promise<PluginToolResult>;
+  execute: (
+    toolCallId: string,
+    params: unknown,
+    signal?: AbortSignal,
+    onUpdate?: (chunk: unknown) => void,
+  ) => Promise<PluginToolResult>;
 };
 
-export type PluginToolFactory = (ctx: PluginToolContext) => PluginToolDefinition[];
+// OpenClaw SDK 约定：一次 registerTool 注一个 tool（或返回 null 表示当前 session 不暴露此 tool）。
+// 工厂会在每次 LLM session materialize 时被调一次，可基于 ctx.agentId / ctx.sessionKey 决定是否启用。
+export type PluginToolFactory = (ctx: PluginToolContext) => PluginToolDefinition | null;
 
 export type PluginToolContext = {
   // OpenClaw 在 per-LLM-run materialize tools 时调一次 factory；ctx 里通常含 sessionKey、agent id 等。

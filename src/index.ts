@@ -14,18 +14,11 @@ import type {
   HiOpenClawPluginConfig,
 } from './types.js';
 import { buildAllControlTools } from './tools/control.js';
-import { buildAllCapabilityTools, getCapabilityToolNames } from './tools/capabilities.js';
+import { buildAllCapabilityTools } from './tools/capabilities.js';
 import { buildAgentEventsService } from './services/agent-events.js';
 import { buildWebhookRoute } from './routes/webhook.js';
 
 const _registeredApis = new WeakSet<PluginRegisterApi>();
-
-const CONTROL_TOOL_NAMES = [
-  'hi_agent_status',
-  'hi_agent_install',
-  'hi_agent_doctor',
-  'hi_agent_reset',
-];
 
 function defaultedConfig(raw: HiOpenClawPluginConfig | undefined): Required<HiOpenClawPluginConfig> {
   return {
@@ -46,6 +39,10 @@ export default function registerHiOpenClawPlugin(api: PluginRegisterApi): void {
   const config = defaultedConfig(api.pluginConfig);
 
   // ---- tools ----
+  // OpenClaw SDK 的 registerTool 签名是：
+  //   api.registerTool(factory: (ctx) => Tool | null, options: { names: [singleName] })
+  // 每次调一个 tool。factory 在每个 LLM session 启动时被调一次，返回该 session 可见的 tool 实例
+  // （可以根据 ctx.agentId / ctx.sessionKey 决定是否暴露）。这里我们让每个 hi tool 总是 visible（无 gating）。
   if (typeof api.registerTool !== 'function') {
     logger.warn?.(
       '[hi-openclaw-plugin] host does not expose api.registerTool; tools will not be visible. Upgrade OpenClaw to >=2026.4.23.',
@@ -54,12 +51,13 @@ export default function registerHiOpenClawPlugin(api: PluginRegisterApi): void {
     const controlTools = buildAllControlTools(config);
     const capabilityTools = buildAllCapabilityTools(config);
     const allTools: PluginToolDefinition[] = [...controlTools, ...capabilityTools];
-    const allNames = [...CONTROL_TOOL_NAMES, ...getCapabilityToolNames()];
-    api.registerTool(
-      () => allTools,
-      { names: allNames, optional: false },
-    );
-    logger.info?.('[hi-openclaw-plugin] registered tools', { count: allTools.length, names: allNames });
+    for (const tool of allTools) {
+      api.registerTool(
+        () => tool,
+        { names: [tool.name] },
+      );
+    }
+    logger.info?.('[hi-openclaw-plugin] registered tools', { count: allTools.length, names: allTools.map(t => t.name) });
   }
 
   // ---- service ----
