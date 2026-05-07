@@ -157,6 +157,36 @@ export async function ensureOpenClawHooksConfigured(args: {
   };
 }
 
+// 保证 OpenClaw 当前 tools.profile (coding/messaging 默认) 下 plugin tools 仍可被 LLM 看见。
+// OpenClaw 的 tool profile 是显式 allowlist —— coding profile 默认只允许 core 工具，plugin
+// 工具被 filter 掉。要打开必须在 tools.alsoAllow 里加 "group:plugins" (canonical 通用钩子)。
+//
+// 由 plugin install tool 程序化处理这件事，绝不让 LLM 自己改 tools.allow（LLM 容易把
+// alsoAllow 写成 allow，allow 是 explicit override 模式，会把 read/exec/sessions_* 等内置
+// 全 filter 掉，导致 LLM 下一轮没工具可用 → embedded fallback 报错 "No callable tools remain"）。
+export async function ensurePluginToolsAlsoAllowed(): Promise<{
+  changed: boolean;
+  also_allow_before: string[];
+  also_allow_after: string[];
+}> {
+  const { root } = await readOpenClawConfig();
+  const tools = ((root as any).tools && typeof (root as any).tools === 'object' && !Array.isArray((root as any).tools))
+    ? { ...((root as any).tools as Record<string, unknown>) }
+    : {};
+  const currentAlsoAllow = Array.isArray((tools as any).alsoAllow)
+    ? ((tools as any).alsoAllow as unknown[]).filter((x): x is string => typeof x === 'string' && x.length > 0)
+    : [];
+  const wantToken = 'group:plugins';
+  if (currentAlsoAllow.includes(wantToken) || currentAlsoAllow.includes('*')) {
+    return { changed: false, also_allow_before: currentAlsoAllow, also_allow_after: currentAlsoAllow };
+  }
+  const nextAlsoAllow = [...currentAlsoAllow, wantToken];
+  (tools as any).alsoAllow = nextAlsoAllow;
+  const nextRoot = { ...root, tools };
+  await atomicWriteJson(OPENCLAW_CONFIG_PATH, nextRoot);
+  return { changed: true, also_allow_before: currentAlsoAllow, also_allow_after: nextAlsoAllow };
+}
+
 // 工具函数：从 OpenClaw config root 读 gateway 监听端口（支持 user 自定义；默认 18789）。
 export function resolveGatewayPort(root: Record<string, unknown>): number {
   const gw = (root as any)?.gateway;

@@ -1,6 +1,6 @@
 {
   "name": "hirey",
-  "version": "1.0.10",
+  "version": "1.0.11",
   "repository": {
     "type": "git",
     "url": "https://github.com/hirey-ai/hi-openclaw-plugin.git"
@@ -35,7 +35,7 @@
     },
     "install": {
       "minHostVersion": ">=2026.5.4",
-      "minHostVersionComment": "实测过：OpenClaw 4.23 / 4.25 装 ClawPack 报 'requires plugin API 1.0, but this OpenClaw runtime exposes 2026.4.x'（4.x runtime 还在用日期格式版本号，不接受语义化 pluginApi=1.0）；5.2 装报 'missing sha256hash and usable files[] metadata for fallback archive verification'（ClawHub server 没给老 5.2 客户端兜底 metadata）。最早能稳装 ClawPack 的 OpenClaw 是 5.4。4.23 ~ 5.3 用户装 prod bundle clawhub:hirey-compatible 走 zip 路径。"
+      "minHostVersionComment": "\u5b9e\u6d4b\u8fc7\uff1aOpenClaw 4.23 / 4.25 \u88c5 ClawPack \u62a5 'requires plugin API 1.0, but this OpenClaw runtime exposes 2026.4.x'\uff084.x runtime \u8fd8\u5728\u7528\u65e5\u671f\u683c\u5f0f\u7248\u672c\u53f7\uff0c\u4e0d\u63a5\u53d7\u8bed\u4e49\u5316 pluginApi=1.0\uff09\uff1b5.2 \u88c5\u62a5 'missing sha256hash and usable files[] metadata for fallback archive verification'\uff08ClawHub server \u6ca1\u7ed9\u8001 5.2 \u5ba2\u6237\u7aef\u515c\u5e95 metadata\uff09\u3002\u6700\u65e9\u80fd\u7a33\u88c5 ClawPack \u7684 OpenClaw \u662f 5.4\u30024.23 ~ 5.3 \u7528\u6237\u88c5 prod bundle clawhub:hirey-compatible \u8d70 zip \u8def\u5f84\u3002"
     }
   },
   "scripts": {

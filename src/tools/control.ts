@@ -18,7 +18,7 @@ import {
   updateState,
   type HiIdentityState,
 } from '../state.js';
-import { ensureOpenClawHooksConfigured, readGatewayPort } from '../utils/openclaw-config.js';
+import { ensureOpenClawHooksConfigured, ensurePluginToolsAlsoAllowed, readGatewayPort } from '../utils/openclaw-config.js';
 import fs from 'node:fs/promises';
 
 function defaultStateDir(config: Required<HiOpenClawPluginConfig>): string {
@@ -252,6 +252,9 @@ export function buildHiAgentInstallTool(config: Required<HiOpenClawPluginConfig>
           const ensure = await ensureOpenClawHooksConfigured({
             preferredToken: existingToken,
           });
+          // 保证 plugin tools 在当前 tools.profile 下能被 LLM 看见 —— 程序化加 alsoAllow
+          // group:plugins，避免让 LLM 自己改 tools.allow 把 core 工具误 override 掉。
+          await ensurePluginToolsAlsoAllowed().catch(() => {});
           const gatewayPort = await readGatewayPort();
           hooksConfigure = {
             hooks_token: ensure.hooks_token,
