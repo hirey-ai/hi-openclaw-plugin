@@ -1,69 +1,113 @@
-// agent-events claim loop service：替换原 hi-agent-receiver 独立 daemon。
-// 在 OpenClaw gateway 进程内长跑：周期性向平台 /v1/agent-events/claim 拉取 owner-actionable
-// events，对每个 event 触发 plugin 内部 webhook route（同一进程内 fetch loopback）让 plugin
-// 把 event 桥接到当前 LLM session。
+// Hi push 推送 daemon —— OpenClaw native plugin 内的 in-process 长跑 service。
 //
-// 这是 native plugin 替代 spawn-based receiver 的核心收益：少 1 个独立进程 + 不需要 hooks token
-// 那一整套间接层。
+// 等价于老 hi-agent-receiver 的 runStreamLoop：
+//   1. 启动 → 先 claim drain backlog（把暂存的 owner-actionable events 清掉）
+//   2. 主路径连 SSE pull_stream（一个长连接 hold 60+ 秒，server 主动推 event id）
+//   3. 收到 SSE event id → fetch event detail → 投递给 OpenClaw → ack consumed
+//   4. SSE 断了 → backoff + 回到第 1 步重新 drain + 重连
+//
+// 这种 outbound-initiated 长连接是 NAT 后面 local agent 收云上 push 的业界 best practice
+// （2026 年 webhook 主导期已经被 SSE / claim 取代），跟 hi-agent-receiver 的官方 daemon 一致。
+//
+// 投递路径：daemon 拉到 event 后通过 buildOpenClawHookPayloadWithRoute 转成跟老 receiver
+// 完全一致的 hook payload，POST 到本机 OpenClaw gateway 的 /<hooks.path>/agent 端点。
+// gateway 收到 → dispatchAgentHook → runCronIsolatedAgentTurn → LLM 跑 turn
+// → OpenClaw 按 hook payload 里的 channel/to 自动通过 iMessage / Telegram 等已注册 channel
+// 把 LLM 输出送到用户。这一段 OpenClaw 自己负责，plugin 不参与。
+//
+// 关键设计：每次 SSE 重连 / drain 都 fresh 重建 OAuth + clients，不缓存，跟 receiver 完全
+// 等价。SSE 断重连周期是分钟级（不是秒级），所以重建 client 的 GC 压力小，不会像 1.0.4 那样
+// 每秒新 fetch agent 把 gateway 进程 4 GB heap 撑爆。
 
-import type { PluginServiceContext, PluginServiceDefinition, HiOpenClawPluginConfig } from '../types.js';
-import { buildAuthorizedClients, type HiAuthorizedClients } from '../clients.js';
+import type {
+  PluginServiceContext,
+  PluginServiceDefinition,
+  HiOpenClawPluginConfig,
+} from '../types.js';
+import {
+  buildAuthorizedClients,
+  type HiAuthorizedClients,
+} from '../clients.js';
 import { resolveStateDir, readState, updateState } from '../state.js';
-import { pushEventToQueue } from '../routes/webhook.js';
+import { buildOpenClawHookPayloadWithRoute } from '../utils/openclaw-hooks-payload.js';
+import { streamAgentEvents } from '@hirey/hi-agent-sdk';
 
-// 缓存 access_token + clients：client_credentials grant token 一般 TTL ~1h，频繁重换会
-// 1) 浪费 OAuth /token 流量；2) 每次 createHiAgentClients 又 hold 一组 fetch / keep-alive socket
-// pool 进 GC root，1.5s 一次跑一小时就是几千份 zombie clients，进程内堆爆。
-// 这里改成单实例 lazy 构造 + token TTL 前自动 refresh + identity 变了就 invalidate。
-type Cached = {
-  identityKey: string;       // identity 的稳定 fingerprint，identity 换了 cache 就失效
-  expiresAtMs: number;       // token 过期墙钟时间
-  clients: HiAuthorizedClients;
+// SSE 重连之间的最小等待，避免连接抖动时疯狂重连。线性 backoff 上限。
+const RECONNECT_BASE_MS = 2_000;
+const RECONNECT_MAX_MS = 30_000;
+// 没装 identity / hooks 配置时的 idle backoff。daemon 不会强求 install，等 install_tool 跑完。
+const IDLE_BACKOFF_MS = 30_000;
+
+type DaemonRuntimeConfig = {
+  hooks_token: string;
+  hooks_path: string;
+  gateway_port: number;
 };
 
-function fingerprintIdentity(state: { identity: { client_id?: string; installation_id?: string; agent_id?: string } | null }): string {
-  if (!state.identity) return '';
-  return [
-    state.identity.agent_id ?? '',
-    state.identity.installation_id ?? '',
-    state.identity.client_id ?? '',
-  ].join('::');
+function resolveHooksUrl(rt: DaemonRuntimeConfig): string {
+  const path = rt.hooks_path.startsWith('/') ? rt.hooks_path : `/${rt.hooks_path}`;
+  // path 形如 "/hooks"；最终 endpoint 是 "/hooks/agent"
+  const cleanedPath = path.endsWith('/') ? path.slice(0, -1) : path;
+  return `http://127.0.0.1:${rt.gateway_port}${cleanedPath}/agent`;
 }
 
-export function buildAgentEventsService(config: Required<HiOpenClawPluginConfig>): PluginServiceDefinition {
+async function deliverEventToHooks(args: {
+  hooksUrl: string;
+  hooksToken: string;
+  event: any;
+  logger: NonNullable<PluginServiceContext['logger']>;
+}): Promise<{ ok: boolean; status: number; body: string }> {
+  // 投递 hook payload：跟老 receiver 完全同形态。
+  const body = buildOpenClawHookPayloadWithRoute({ event: args.event, config: null });
+  const response = await fetch(args.hooksUrl, {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+      'authorization': `Bearer ${args.hooksToken}`,
+    },
+    body: JSON.stringify(body),
+  });
+  const text = await response.text();
+  if (!response.ok) {
+    args.logger.warn?.('[hi-openclaw-plugin] hook delivery failed', {
+      status: response.status,
+      url: args.hooksUrl,
+      body_preview: text.slice(0, 240),
+    });
+    return { ok: false, status: response.status, body: text };
+  }
+  return { ok: true, status: response.status, body: text };
+}
+
+export function buildAgentEventsService(
+  config: Required<HiOpenClawPluginConfig>,
+): PluginServiceDefinition {
   const stateDir = config.stateDir || resolveStateDir(config.profile);
   let stopped = false;
-  let timer: NodeJS.Timeout | null = null;
-  let cached: Cached | null = null;
-  // token-refresh 的安全缓冲：access_token 过期前 30s 主动重换。
-  const TOKEN_REFRESH_LEAD_MS = 30_000;
-  // identity 没装/装错时不要疯狂重试，给一个长间隔
-  const IDLE_BACKOFF_MS = 30_000;
+  let activeAbort: AbortController | null = null;
 
   return {
     id: 'hi-agent-events',
+
     async start(ctx: PluginServiceContext) {
       stopped = false;
       const logger = ctx.logger;
-      logger.info?.('[hi-openclaw-plugin] agent-events service starting', {
+      logger.info?.('[hi-openclaw-plugin] agent-events service starting (sse pull_stream + claim drain)', {
         profile: config.profile,
         platform: config.platformBaseUrl,
-        poll_interval_ms: config.claimPollIntervalMs,
       });
 
-      const ensureClients = async (): Promise<HiAuthorizedClients | null> => {
-        const now = Date.now();
-        // 看 state 里 identity 有没有变（用户重装 / quarantine reset 等）
+      const isReady = async (): Promise<{
+        auth: HiAuthorizedClients | null;
+        rt: DaemonRuntimeConfig | null;
+      }> => {
         const state = await readState(stateDir, config.profile);
-        if (!state.identity) {
-          if (cached) cached = null;
-          return null;
+        if (!state.identity) return { auth: null, rt: null };
+        const inst = state.runtime?.install;
+        if (!inst?.hooks_token || !inst?.hooks_path || !inst?.gateway_port) {
+          return { auth: null, rt: null };
         }
-        const fp = fingerprintIdentity(state);
-        if (cached && cached.identityKey === fp && cached.expiresAtMs > now + TOKEN_REFRESH_LEAD_MS) {
-          return cached.clients;
-        }
-        const fresh = await buildAuthorizedClients({
+        const auth = await buildAuthorizedClients({
           stateDir, profile: config.profile, platformBaseUrl: config.platformBaseUrl,
         }).catch((err: any) => {
           const msg = String(err?.message || err);
@@ -72,115 +116,184 @@ export function buildAgentEventsService(config: Required<HiOpenClawPluginConfig>
           }
           return null;
         });
-        if (!fresh) return null;
-        // hi-agent-sdk 的 token exchange 默认用 1h TTL，没 expose 实际 expires_in；保守 50min。
-        const expiresAtMs = now + 50 * 60_000;
-        cached = { identityKey: fp, expiresAtMs, clients: fresh };
-        logger.info?.('[hi-openclaw-plugin] auth clients (re)built', { identity_fp: fp, expires_in_min: 50 });
-        return fresh;
+        if (!auth) return { auth: null, rt: null };
+        return {
+          auth,
+          rt: {
+            hooks_token: inst.hooks_token,
+            hooks_path: inst.hooks_path,
+            gateway_port: inst.gateway_port,
+          },
+        };
       };
 
-      const tick = async () => {
-        if (stopped) return;
-        let backoffMs = config.claimPollIntervalMs;
+      // 把一个 event snapshot 走完整的 deliver-then-ack 流程。
+      const deliverAndAck = async (params: {
+        auth: HiAuthorizedClients;
+        rt: DaemonRuntimeConfig;
+        event: any;
+        leaseId?: string | null;
+      }) => {
+        const { auth, rt, event, leaseId } = params;
+        const hooksUrl = resolveHooksUrl(rt);
+        let result: any = null;
         try {
-          const auth = await ensureClients();
-          if (!auth) {
-            backoffMs = IDLE_BACKOFF_MS;
-            return;
-          }
-          const claim = await auth.gateway.claimEvents({
-            limit: 20,
-            lease_ms: config.claimLeaseMs,
-          } as any);
-          const items = (claim?.items || []) as any[];
-          if (items.length > 0) {
-            logger.info?.(`[hi-openclaw-plugin] claimed ${items.length} agent event(s)`, {
-              first_topic: items[0]?.topic,
-              first_event_id: items[0]?.event_id,
-            });
-            for (const ev of items) {
-              try { pushEventToQueue(ev as Record<string, unknown>); }
-              catch (err: any) {
-                logger.warn?.('[hi-openclaw-plugin] queue push failed', { error: String(err?.message || err) });
-              }
-            }
-            try {
-              await auth.gateway.ackEvents({
-                lease_id: claim.claim_lease_id,
-                acks: items.map((ev: any) => ({ event_id: ev.event_id, status: 'consumed', stream_seq: ev.stream_seq })),
-              } as any);
-            } catch (err: any) {
-              logger.warn?.('[hi-openclaw-plugin] event ack failed', { error: String(err?.message || err) });
-            }
-            await updateState(stateDir, config.profile, (cur) => ({
-              ...cur,
-              runtime: {
-                ...cur.runtime,
-                last_consumed_stream_seq: Math.max(
-                  cur.runtime.last_consumed_stream_seq,
-                  Math.max(0, ...items.map((ev: any) => Number(ev.stream_seq) || 0)),
-                ),
-                last_claim_lease_id: claim.claim_lease_id || cur.runtime.last_claim_lease_id,
-                updated_at: new Date().toISOString(),
-              },
-            })).catch(() => {});
-          }
+          const r = await deliverEventToHooks({
+            hooksUrl, hooksToken: rt.hooks_token, event, logger,
+          });
+          result = r;
         } catch (err: any) {
-          const msg = String(err?.message || err);
-          // 401 一般是 token 失效，立刻 invalidate cache 让下次重新换 token
-          if (msg.includes('401') || /unauthorized/i.test(msg)) {
-            cached = null;
+          // 投递异常 → ack failed，平台后续重投。
+          await auth.gateway.ackEvents({
+            ...(leaseId ? { lease_id: leaseId } : {}),
+            acks: [{
+              event_id: event.event_id,
+              status: 'failed',
+              last_error: String(err?.message || err),
+              retry_after_ms: 60_000,
+            }],
+          } as any).catch(() => {});
+          return;
+        }
+        if (!result.ok) {
+          await auth.gateway.ackEvents({
+            ...(leaseId ? { lease_id: leaseId } : {}),
+            acks: [{
+              event_id: event.event_id,
+              status: 'failed',
+              last_error: `hook_delivery_${result.status}`,
+              retry_after_ms: 60_000,
+            }],
+          } as any).catch(() => {});
+          return;
+        }
+        await auth.gateway.ackEvents({
+          ...(leaseId ? { lease_id: leaseId } : {}),
+          acks: [{
+            event_id: event.event_id,
+            status: 'consumed',
+          }],
+        } as any).catch((err: any) => {
+          logger.warn?.('[hi-openclaw-plugin] event ack failed', { error: String(err?.message || err) });
+        });
+        // bump runtime cursor
+        await updateState(stateDir, config.profile, (cur) => ({
+          ...cur,
+          runtime: {
+            ...cur.runtime,
+            last_consumed_stream_seq: Math.max(
+              cur.runtime.last_consumed_stream_seq,
+              Number(event.stream_seq) || 0,
+            ),
+            updated_at: new Date().toISOString(),
+          },
+        })).catch(() => {});
+      };
+
+      // 启动 / 重连前 drain backlog —— 用 short claim 把已经累积的 events 清完。
+      const drainBacklog = async (auth: HiAuthorizedClients, rt: DaemonRuntimeConfig) => {
+        while (!stopped) {
+          const state = await readState(stateDir, config.profile);
+          const claimed = await auth.gateway.claimEvents({
+            after_seq: state.runtime.last_consumed_stream_seq || 0,
+            limit: 20,
+            ...(state.runtime.last_claim_lease_id ? { claim_lease_id: state.runtime.last_claim_lease_id } : {}),
+          } as any);
+          await updateState(stateDir, config.profile, (cur) => ({
+            ...cur,
+            runtime: {
+              ...cur.runtime,
+              last_claim_lease_id: claimed.claim_lease_id || cur.runtime.last_claim_lease_id,
+            },
+          })).catch(() => {});
+          const items = (claimed?.items || []) as any[];
+          if (items.length === 0) return;
+          logger.info?.(`[hi-openclaw-plugin] drained ${items.length} backlog event(s)`, {
+            first_topic: items[0]?.topic,
+          });
+          for (const ev of items) {
+            if (stopped) return;
+            await deliverAndAck({ auth, rt, event: ev, leaseId: claimed.claim_lease_id });
           }
-          if (!msg.includes('hi_identity_missing')) {
-            logger.warn?.('[hi-openclaw-plugin] agent-events tick error', { error: msg });
-          }
-        } finally {
-          scheduleNext(backoffMs);
         }
       };
 
-      const scheduleNext = (delayMs: number) => {
-        if (stopped) return;
-        timer = setTimeout(tick, delayMs);
+      // 一次 SSE 长连接 session。流抽干 / 断 / throw 时返回，外层做重连。
+      const runOneSseSession = async (auth: HiAuthorizedClients, rt: DaemonRuntimeConfig) => {
+        const state = await readState(stateDir, config.profile);
+        const lastSeq = state.runtime.last_consumed_stream_seq || 0;
+        const streamUrl = (auth.gateway as any).streamUrl
+          ? (auth.gateway as any).streamUrl(lastSeq)
+          : `${config.platformBaseUrl}/v1/agent-events/stream${lastSeq ? `?after_seq=${lastSeq}` : ''}`;
+        logger.info?.('[hi-openclaw-plugin] sse connect', { url: streamUrl, after_seq: lastSeq });
+        for await (const envelope of streamAgentEvents({
+          url: streamUrl,
+          token: auth.accessToken,
+        })) {
+          if (stopped) return;
+          if (envelope.event !== 'agent_event') continue;
+          const eventId = (envelope.data as any)?.event_id;
+          if (!eventId || typeof eventId !== 'string') continue;
+          // SSE envelope 里通常是 envelope（精简）；一些字段（reply_route_snapshot / payload）可能要 fetch
+          // 完整 snapshot 才有，跟 receiver 一致。
+          let fullEvent: any = envelope.data;
+          if (typeof (auth.gateway as any).fetchEvent === 'function') {
+            try {
+              const fetched = await (auth.gateway as any).fetchEvent(eventId);
+              if (fetched?.ok && fetched?.event) fullEvent = fetched.event;
+            } catch (err: any) {
+              logger.warn?.('[hi-openclaw-plugin] fetchEvent failed, using envelope only', {
+                event_id: eventId,
+                error: String(err?.message || err),
+              });
+            }
+          }
+          await deliverAndAck({ auth, rt, event: fullEvent, leaseId: null });
+        }
       };
 
-      // PROBE: 二分定位 OOM —— 'first-only' 表示跑一次 tick 但不 schedule loop。
-      // 能区分 OOM 来自 service register/first-tick 还是 tick 循环累积。
-      const TICK_MODE = 'first-only' as 'normal' | 'first-only' | 'disabled';
-      if ((TICK_MODE as string) === 'normal') {
-        void tick();
-      } else if ((TICK_MODE as string) === 'first-only') {
-        const onceTick = async () => {
-          if (stopped) return;
+      // 主循环：drain → SSE → drain → SSE …
+      const runMainLoop = async () => {
+        let backoffMs = RECONNECT_BASE_MS;
+        while (!stopped) {
+          const ready = await isReady();
+          if (!ready.auth || !ready.rt) {
+            await sleep(IDLE_BACKOFF_MS);
+            continue;
+          }
           try {
-            const auth = await ensureClients();
-            if (!auth) return;
-            const claim = await auth.gateway.claimEvents({ limit: 20, lease_ms: config.claimLeaseMs } as any);
-            const items = (claim?.items || []) as any[];
-            for (const ev of items) {
-              try { pushEventToQueue(ev as Record<string, unknown>); } catch { /* swallow */ }
-            }
-          } catch { /* swallow */ }
-        };
-        void onceTick();
-      }
-      // 抑制 unused warning：normal 模式下我们要保留 scheduleNext 跟 tick 引用
-      void scheduleNext;
-      void tick;
-      logger.info?.('[hi-openclaw-plugin] agent-events service started', {
-        webhook_loopback: config.webhookPath,
-        tick_mode: TICK_MODE,
-      });
+            await drainBacklog(ready.auth, ready.rt);
+            backoffMs = RECONNECT_BASE_MS;
+            await runOneSseSession(ready.auth, ready.rt);
+            // 流自然结束（远端关闭），立刻重新 drain + 重连
+            backoffMs = RECONNECT_BASE_MS;
+          } catch (err: any) {
+            const msg = String(err?.message || err);
+            logger.warn?.('[hi-openclaw-plugin] sse loop error, will reconnect', { error: msg, backoff_ms: backoffMs });
+            await sleep(backoffMs);
+            backoffMs = Math.min(backoffMs * 2, RECONNECT_MAX_MS);
+          }
+        }
+      };
+
+      // 用 abort signal 让 stop() 能干净中断 SSE / sleep
+      const abort = new AbortController();
+      activeAbort = abort;
+      void runMainLoop();
+      logger.info?.('[hi-openclaw-plugin] agent-events service started');
     },
+
     async stop(ctx: PluginServiceContext) {
       stopped = true;
-      if (timer) {
-        clearTimeout(timer);
-        timer = null;
+      if (activeAbort) {
+        try { activeAbort.abort(); } catch {}
+        activeAbort = null;
       }
-      cached = null;
       ctx.logger.info?.('[hi-openclaw-plugin] agent-events service stopped');
     },
   };
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }

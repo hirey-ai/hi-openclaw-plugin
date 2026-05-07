@@ -33,6 +33,12 @@ export type HiInstallRuntimeState = {
   webhook_path: string | null;
   receiver_last_started_at: string | null;
   receiver_last_error: string | null;
+  // Native plugin daemon 把 hi event 投递回本机 OpenClaw gateway 走 /hooks/agent；
+  // hooks_token 跟 hooks_path 是 install tool 写入 ~/.openclaw/openclaw.json 的同一份值。
+  // gateway_port 默认 18789，但 plugin 启动时会从 OpenClaw 实际配置/runtime context 校正。
+  hooks_token: string | null;
+  hooks_path: string | null;
+  gateway_port: number | null;
 };
 
 export type HiRuntimeState = {
@@ -72,6 +78,9 @@ export function buildEmptyState(profile: string): HiPersistedState {
         webhook_path: null,
         receiver_last_started_at: null,
         receiver_last_error: null,
+        hooks_token: null,
+        hooks_path: null,
+        gateway_port: null,
       },
       updated_at: null,
     },
@@ -95,6 +104,9 @@ export async function readState(stateDir: string, profile: string): Promise<HiPe
           webhook_path: (parsed.runtime?.install as any)?.webhook_path ?? null,
           receiver_last_started_at: parsed.runtime?.install?.receiver_last_started_at ?? null,
           receiver_last_error: parsed.runtime?.install?.receiver_last_error ?? null,
+          hooks_token: (parsed.runtime?.install as any)?.hooks_token ?? null,
+          hooks_path: (parsed.runtime?.install as any)?.hooks_path ?? null,
+          gateway_port: (parsed.runtime?.install as any)?.gateway_port ?? null,
         },
         updated_at: parsed.runtime?.updated_at ?? null,
       },

@@ -61,19 +61,23 @@ export default function registerHiOpenClawPlugin(api: PluginRegisterApi): void {
   }
 
   // ---- service / route ----
-  // 通过二分定位（1.0.5 disable-all 稳；1.0.7 first-tick-only 稳）证实 gateway OOM 来自 daemon
-  // claim loop（每 1.5s 一次 OAuth + claimEvents 长 poll，1 小时累积 fetch agent / 已 fired
-  // setTimeout closure / undici socket pool 一直 hold 不放，4 GB heap 爆掉）。
+  // 1.0.9 起恢复 daemon claim/SSE 模式，但走 push 推送架构（拉到 event 后 POST hooks/agent
+  // loopback，OpenClaw 自动按 channel/to 把 LLM 输出推到用户 iMessage/Telegram 等已配置的
+  // channel）。
   //
-  // 治本方案 = 拥抱 OpenClaw native plugin 的 lazy/in-process 哲学：去掉后台 daemon 循环，
-  // 改 LLM 主动调 hi_pull_events 工具按需拉一次（in-tool-call 的 fetch + token 即用即丢，进
-  // tool boundary 之后整个 closure 让 GC 回收）。这跟 OpenClaw memory_search 这类 lazy tool
-  // 的设计完全一致。
-  //
-  // webhook route 仍然保留（轻量；只在收到入站请求时分配 buffer 然后释放）；目前主要给同机内
-  // 自测 curl 用，未来万一某些场景平台真能 push 到 host 也能直接收。
-  // void buildAgentEventsService;  // intentionally not registered to avoid claim loop OOM
-  void buildAgentEventsService(config); // keep import live; not registering as a service.
+  // 修 OOM 的关键不在去循环（业务上 push 必须长跑，pull 模型是错的），而在：
+  //   - 主路径换成 SSE pull_stream 长连接（1 个 conn hold 60+ 秒，重连周期分钟级），不再
+  //     每 1.5s 新建 fetch agent
+  //   - 启动 + 重连前先 claim drain backlog 兜底
+  //   - 不缓存 client（每次重连重建，跟官方 hi-agent-receiver runStreamLoop 等价）
+  //   - hooks/agent 投递的 fetch 是 fire-and-forget，不长占 socket
+  if (typeof api.registerService === 'function') {
+    api.registerService(buildAgentEventsService(config));
+  } else {
+    logger.warn?.(
+      '[hi-openclaw-plugin] host does not expose api.registerService; agent-events daemon will not run, push delivery disabled. Upgrade OpenClaw to >=2026.4.23.',
+    );
+  }
   if (typeof api.registerHttpRoute === 'function') {
     api.registerHttpRoute(buildWebhookRoute(config, logger));
   }

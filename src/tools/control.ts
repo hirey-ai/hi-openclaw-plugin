@@ -18,6 +18,7 @@ import {
   updateState,
   type HiIdentityState,
 } from '../state.js';
+import { ensureOpenClawHooksConfigured, readGatewayPort } from '../utils/openclaw-config.js';
 import fs from 'node:fs/promises';
 
 function defaultStateDir(config: Required<HiOpenClawPluginConfig>): string {
@@ -232,6 +233,44 @@ export function buildHiAgentInstallTool(config: Required<HiOpenClawPluginConfig>
           };
         }
 
+        // Step 4.5: 保证 OpenClaw 主 config 的 hooks 段被启用 + 写入一致的 hooks_token，
+        // 这样 native plugin daemon 拉到 hi event 后可以 POST 进 /hooks/agent 触发 isolated
+        // agentTurn，OpenClaw 自动按 hook payload 的 channel/to 路由把 LLM 输出投递给用户。
+        // 等价于老 bundle plugin 的 buildManagedHooksConfig + openclaw config set hooks。
+        let hooksConfigure: {
+          hooks_token: string; hooks_path: string; gateway_port: number; changed: boolean;
+        } | null = null;
+        let hooksConfigureError: { message: string } | null = null;
+        try {
+          const existingState = state;
+          const existingToken = existingState.runtime?.install?.hooks_token || null;
+          const ensure = await ensureOpenClawHooksConfigured({
+            preferredToken: existingToken,
+          });
+          const gatewayPort = await readGatewayPort();
+          hooksConfigure = {
+            hooks_token: ensure.hooks_token,
+            hooks_path: ensure.hooks_path,
+            gateway_port: gatewayPort,
+            changed: ensure.changed,
+          };
+          state = await updateState(stateDir, config.profile, (cur) => ({
+            ...cur,
+            runtime: {
+              ...cur.runtime,
+              install: {
+                ...cur.runtime.install,
+                host_kind: 'openclaw_native_plugin',
+                hooks_token: ensure.hooks_token,
+                hooks_path: ensure.hooks_path,
+                gateway_port: gatewayPort,
+              },
+            },
+          }));
+        } catch (err: any) {
+          hooksConfigureError = { message: String(err?.message || err) };
+        }
+
         // Step 5: subscribe default topics
         // 注意：installed @hirey/hi-agent-sdk@0.1.10 的 AgentGatewayTopic union 还是老 6-topic 版（漏 hi.release.published），
         // 但平台已经支持 hi.release.published（0.1.11 sdk 才在 type 里加进来）。这里用 string[] + cast 绕开 type 漂移。
@@ -251,7 +290,7 @@ export function buildHiAgentInstallTool(config: Required<HiOpenClawPluginConfig>
         }
 
         return asJsonResult({
-          ok: !installationUpdateError,
+          ok: !installationUpdateError && !hooksConfigureError,
           profile: config.profile,
           state_dir: stateDir,
           quarantined_stale_identity: peekQuarantineNotice(),
@@ -260,13 +299,19 @@ export function buildHiAgentInstallTool(config: Required<HiOpenClawPluginConfig>
           installation: installationUpdate,
           installation_update_error: installationUpdateError,
           subscriptions: subscriptionsResp,
+          hooks_configure: hooksConfigure,
+          hooks_configure_error: hooksConfigureError,
           summary: {
             agent_id: state.identity?.agent_id,
             installation_id: state.identity?.installation_id,
             connected: true,
             activated: !!state.identity?.activated_at,
-            event_path: 'plugin_native',
+            event_path: 'plugin_native_hooks_loopback',
             installation_update_succeeded: !installationUpdateError,
+            hooks_ready: !!hooksConfigure && !hooksConfigureError,
+            push_path_hint: hooksConfigure
+              ? `http://127.0.0.1:${hooksConfigure.gateway_port}${hooksConfigure.hooks_path}/agent`
+              : null,
           },
         });
       } catch (err: any) {
