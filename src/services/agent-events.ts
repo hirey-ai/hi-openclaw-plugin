@@ -7,14 +7,39 @@
 // 那一整套间接层。
 
 import type { PluginServiceContext, PluginServiceDefinition, HiOpenClawPluginConfig } from '../types.js';
-import { buildAuthorizedClients, peekQuarantineNotice } from '../clients.js';
-import { resolveStateDir, updateState } from '../state.js';
+import { buildAuthorizedClients, type HiAuthorizedClients } from '../clients.js';
+import { resolveStateDir, readState, updateState } from '../state.js';
 import { pushEventToQueue } from '../routes/webhook.js';
+
+// 缓存 access_token + clients：client_credentials grant token 一般 TTL ~1h，频繁重换会
+// 1) 浪费 OAuth /token 流量；2) 每次 createHiAgentClients 又 hold 一组 fetch / keep-alive socket
+// pool 进 GC root，1.5s 一次跑一小时就是几千份 zombie clients，进程内堆爆。
+// 这里改成单实例 lazy 构造 + token TTL 前自动 refresh + identity 变了就 invalidate。
+type Cached = {
+  identityKey: string;       // identity 的稳定 fingerprint，identity 换了 cache 就失效
+  expiresAtMs: number;       // token 过期墙钟时间
+  clients: HiAuthorizedClients;
+};
+
+function fingerprintIdentity(state: { identity: { client_id?: string; installation_id?: string; agent_id?: string } | null }): string {
+  if (!state.identity) return '';
+  return [
+    state.identity.agent_id ?? '',
+    state.identity.installation_id ?? '',
+    state.identity.client_id ?? '',
+  ].join('::');
+}
 
 export function buildAgentEventsService(config: Required<HiOpenClawPluginConfig>): PluginServiceDefinition {
   const stateDir = config.stateDir || resolveStateDir(config.profile);
   let stopped = false;
   let timer: NodeJS.Timeout | null = null;
+  let cached: Cached | null = null;
+  // token-refresh 的安全缓冲：access_token 过期前 30s 主动重换。
+  const TOKEN_REFRESH_LEAD_MS = 30_000;
+  // identity 没装/装错时不要疯狂重试，给一个长间隔
+  const IDLE_BACKOFF_MS = 30_000;
+
   return {
     id: 'hi-agent-events',
     async start(ctx: PluginServiceContext) {
@@ -26,15 +51,42 @@ export function buildAgentEventsService(config: Required<HiOpenClawPluginConfig>
         poll_interval_ms: config.claimPollIntervalMs,
       });
 
+      const ensureClients = async (): Promise<HiAuthorizedClients | null> => {
+        const now = Date.now();
+        // 看 state 里 identity 有没有变（用户重装 / quarantine reset 等）
+        const state = await readState(stateDir, config.profile);
+        if (!state.identity) {
+          if (cached) cached = null;
+          return null;
+        }
+        const fp = fingerprintIdentity(state);
+        if (cached && cached.identityKey === fp && cached.expiresAtMs > now + TOKEN_REFRESH_LEAD_MS) {
+          return cached.clients;
+        }
+        const fresh = await buildAuthorizedClients({
+          stateDir, profile: config.profile, platformBaseUrl: config.platformBaseUrl,
+        }).catch((err: any) => {
+          const msg = String(err?.message || err);
+          if (!msg.includes('hi_identity_missing')) {
+            logger.warn?.('[hi-openclaw-plugin] auth client build failed', { error: msg });
+          }
+          return null;
+        });
+        if (!fresh) return null;
+        // hi-agent-sdk 的 token exchange 默认用 1h TTL，没 expose 实际 expires_in；保守 50min。
+        const expiresAtMs = now + 50 * 60_000;
+        cached = { identityKey: fp, expiresAtMs, clients: fresh };
+        logger.info?.('[hi-openclaw-plugin] auth clients (re)built', { identity_fp: fp, expires_in_min: 50 });
+        return fresh;
+      };
+
       const tick = async () => {
         if (stopped) return;
+        let backoffMs = config.claimPollIntervalMs;
         try {
-          // 没 identity 之前 claim 不可能 work，安静等到下次 install
-          const auth = await buildAuthorizedClients({
-            stateDir, profile: config.profile, platformBaseUrl: config.platformBaseUrl,
-          }).catch(() => null);
+          const auth = await ensureClients();
           if (!auth) {
-            scheduleNext();
+            backoffMs = IDLE_BACKOFF_MS;
             return;
           }
           const claim = await auth.gateway.claimEvents({
@@ -47,15 +99,12 @@ export function buildAgentEventsService(config: Required<HiOpenClawPluginConfig>
               first_topic: items[0]?.topic,
               first_event_id: items[0]?.event_id,
             });
-            // 进程内直推 event 到 webhook queue（同一 plugin 内部，不走 fetch，也不读 env，
-            // 避开 OpenClaw install scanner 的 "credential harvesting (env + network)" 误报）。
             for (const ev of items) {
               try { pushEventToQueue(ev as Record<string, unknown>); }
               catch (err: any) {
                 logger.warn?.('[hi-openclaw-plugin] queue push failed', { error: String(err?.message || err) });
               }
             }
-            // ack consumed events back to platform
             try {
               await auth.gateway.ackEvents({
                 lease_id: claim.claim_lease_id,
@@ -64,7 +113,6 @@ export function buildAgentEventsService(config: Required<HiOpenClawPluginConfig>
             } catch (err: any) {
               logger.warn?.('[hi-openclaw-plugin] event ack failed', { error: String(err?.message || err) });
             }
-            // bump persisted runtime cursor
             await updateState(stateDir, config.profile, (cur) => ({
               ...cur,
               runtime: {
@@ -79,26 +127,27 @@ export function buildAgentEventsService(config: Required<HiOpenClawPluginConfig>
             })).catch(() => {});
           }
         } catch (err: any) {
-          // identity_missing 是预期，不刷屏
           const msg = String(err?.message || err);
+          // 401 一般是 token 失效，立刻 invalidate cache 让下次重新换 token
+          if (msg.includes('401') || /unauthorized/i.test(msg)) {
+            cached = null;
+          }
           if (!msg.includes('hi_identity_missing')) {
             logger.warn?.('[hi-openclaw-plugin] agent-events tick error', { error: msg });
           }
         } finally {
-          scheduleNext();
+          scheduleNext(backoffMs);
         }
       };
 
-      const scheduleNext = () => {
+      const scheduleNext = (delayMs: number) => {
         if (stopped) return;
-        timer = setTimeout(tick, config.claimPollIntervalMs);
+        timer = setTimeout(tick, delayMs);
       };
 
-      // first tick immediately
       void tick();
       logger.info?.('[hi-openclaw-plugin] agent-events service started', {
         webhook_loopback: config.webhookPath,
-        quarantined_stale_identity: peekQuarantineNotice(),
       });
     },
     async stop(ctx: PluginServiceContext) {
@@ -107,6 +156,7 @@ export function buildAgentEventsService(config: Required<HiOpenClawPluginConfig>
         clearTimeout(timer);
         timer = null;
       }
+      cached = null;
       ctx.logger.info?.('[hi-openclaw-plugin] agent-events service stopped');
     },
   };
