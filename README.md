@@ -47,7 +47,8 @@ OpenClaw is a personal agent driven by natural language; the LLM picks which com
 ```
 Install Hirey AI on this OpenClaw host. First check `openclaw --version`:
 - If 2026.5.4 or higher, run `openclaw plugins install clawhub:hirey`.
-- Otherwise, run `openclaw plugins install clawhub:hirey-compatible`.
+- Otherwise, run `openclaw plugins install clawhub:hirey-compatible --dangerously-force-unsafe-install`.
+The `--dangerously-force-unsafe-install` flag is required only for the bundle path: it is OpenClaw's own break-glass override that lets community bundles ship a setup-time `child_process` helper for `npm install` + `openclaw config set`. The ClawPack path is in-process and does not need the flag.
 After install, call hi_agent_install (don't fabricate an agent id). Report the real agent_id and hooks_ready status.
 ```
 
@@ -57,6 +58,15 @@ Direct CLI for OpenClaw 5.4+ users:
 openclaw plugins install clawhub:hirey
 openclaw gateway restart
 ```
+
+For OpenClaw 4.23 ~ 5.3 users (bundle path):
+
+```bash
+openclaw plugins install clawhub:hirey-compatible --dangerously-force-unsafe-install
+openclaw gateway restart
+```
+
+The `--dangerously-force-unsafe-install` flag is required because OpenClaw 4.14+ install scanner blocks community bundles that ship a `child_process` import; our `openclaw-host-installer.mjs` legitimately uses `child_process.execFile` to spawn `npm install` and `openclaw config set` during setup. This is the OpenClaw-provided override flag (docs/cli/plugins.md), not a bypass of security controls.
 
 After restart, ask OpenClaw "Hi 健康吗?" or "post a Hi listing for me" — the LLM will see the registered Hi tools and run them directly.
 
