@@ -199,21 +199,38 @@ export function buildHiAgentInstallTool(config: Required<HiOpenClawPluginConfig>
         // Native plugin 模式下，user host 在 NAT 后面，公网 hi platform 推不到 localhost；
         // 所以唯一真实工作的 delivery 是 pull_stream（plugin 内的 agent-events service 主动从
         // 平台拉 event）。webhook 路由仍然挂在 gateway 上 (registerHttpRoute) 但只供同机内 curl
-        // 自测，不暴露给平台。所以这里只声明 pull_stream，preferred 也是 pull_stream。
-        const installationUpdate = await auth.gateway.updateInstallation({
-          delivery_capabilities: {
-            preferred: 'pull_stream',
-            capabilities: [
-              { kind: 'pull_stream', status: 'active', config: {} },
-            ],
-            route_missing_policy: 'use_explicit_default_route',
-            default_reply_route: args.host_session_key ? {
-              installation_id: state.identity!.installation_id,
-              session_key: args.host_session_key,
-              delivery_context: { channel: 'last', to: null, account_id: null, thread_id: null },
-            } : null,
-          } as any,
-        });
+        // 自测，不暴露给平台。
+        // 注意 platform schema 约束：route_missing_policy=use_explicit_default_route 必须搭配
+        // 实际的 default_reply_route 对象；没 host_session_key 时直接 omit 这两个字段，让平台走
+        // 默认 (route_missing_policy=use_last_active_session) 兜底。
+        const deliveryCapsBody: Record<string, unknown> = {
+          preferred: 'pull_stream',
+          capabilities: [
+            { kind: 'pull_stream', status: 'active', config: {} },
+          ],
+        };
+        if (args.host_session_key) {
+          deliveryCapsBody.route_missing_policy = 'use_explicit_default_route';
+          deliveryCapsBody.default_reply_route = {
+            installation_id: state.identity!.installation_id,
+            session_key: args.host_session_key,
+            delivery_context: { channel: 'last', to: null, account_id: null, thread_id: null },
+          };
+        }
+        let installationUpdate: any = null;
+        let installationUpdateError: { message: string; response_body?: unknown } | null = null;
+        try {
+          installationUpdate = await auth.gateway.updateInstallation({
+            delivery_capabilities: deliveryCapsBody,
+          } as any);
+        } catch (err: any) {
+          // SDK 把详细 error 吞了，这里包一份 surface 出去，让 doctor / install caller 看见到底
+          // 是 schema 拒绝还是平台 5xx 还是别的。安装的其它步骤照样视为成功（identity 已建好）。
+          installationUpdateError = {
+            message: String(err?.message || err),
+            response_body: err?.response_body ?? err?.responseBody ?? err?.body ?? null,
+          };
+        }
 
         // Step 5: subscribe default topics
         // 注意：installed @hirey/hi-agent-sdk@0.1.10 的 AgentGatewayTopic union 还是老 6-topic 版（漏 hi.release.published），
@@ -234,13 +251,14 @@ export function buildHiAgentInstallTool(config: Required<HiOpenClawPluginConfig>
         }
 
         return asJsonResult({
-          ok: true,
+          ok: !installationUpdateError,
           profile: config.profile,
           state_dir: stateDir,
           quarantined_stale_identity: peekQuarantineNotice(),
           register: registerResp,
           activate: activateResp,
           installation: installationUpdate,
+          installation_update_error: installationUpdateError,
           subscriptions: subscriptionsResp,
           summary: {
             agent_id: state.identity?.agent_id,
@@ -248,6 +266,7 @@ export function buildHiAgentInstallTool(config: Required<HiOpenClawPluginConfig>
             connected: true,
             activated: !!state.identity?.activated_at,
             event_path: 'plugin_native',
+            installation_update_succeeded: !installationUpdateError,
           },
         });
       } catch (err: any) {
