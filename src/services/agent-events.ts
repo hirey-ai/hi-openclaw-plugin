@@ -31,6 +31,46 @@ import {
 import { resolveStateDir, readState, updateState } from '../state.js';
 import { buildOpenClawHookPayloadWithRoute } from '../utils/openclaw-hooks-payload.js';
 import { streamAgentEvents } from '@hirey/hi-agent-sdk';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+
+// 找用户在 OpenClaw 上**最近活跃的非 hook session_key**。
+// 用于把 install_welcome_recommendation 这种 "owner 安装欢迎" 类一次性 push 直接落到用户
+// 当前正在用的 chat 里（不要走默认 hook:<uuid> 的 isolated session，否则用户在主对话窗
+// 看不到，等于装完一片空白 → 流失）。
+//
+// hook:* session 是 OpenClaw 给 isolated agentTurn 自动开的旁路 session，用户在主 chat
+// 看不到；所以这里显式 skip。
+//
+// 其它常规 push（agent.message.created / pairing.* / meeting.* 等）保留 OpenClaw 默认行为
+// （isolated hook session），不动 sessionKey，由 OpenClaw 决定怎么 surface 到 user channel。
+function findRecentUserSessionKey(): string | null {
+  // OpenClaw 默认 agent id 是 main；多 agent 户暂不覆盖，需要时再扩 plugin config 暴露。
+  const sessionsFile = path.join(os.homedir(), '.openclaw', 'agents', 'main', 'sessions', 'sessions.json');
+  try {
+    const raw = fs.readFileSync(sessionsFile, 'utf8');
+    const parsed = JSON.parse(raw) as { sessions?: Array<{ key?: string; updatedAt?: number }> };
+    const sessions = parsed.sessions || [];
+    const filtered = sessions.filter((s) => {
+      const k = String(s.key || '');
+      // skip hook:* + 空 + 我们之前已知的 install/health 元 session 命名
+      return k.length > 0 && !k.includes(':hook:') && !k.includes(':bootstrap:');
+    });
+    filtered.sort((a, b) => (Number(b.updatedAt) || 0) - (Number(a.updatedAt) || 0));
+    return filtered[0]?.key || null;
+  } catch {
+    return null;
+  }
+}
+
+// 哪些 event topics + payload kind 应该被强制落到 user 当前 chat。
+// 当前只有 install_welcome_recommendation 一种 — 它是用户安装完毕后的"第一印象"消息，
+// 必须立即看到才不会让 owner 觉得"装完没事干"流失。
+function shouldRouteToUserCurrentChat(event: any): boolean {
+  const kind = event?.payload?.kind;
+  return kind === 'install_welcome_recommendation';
+}
 
 // SSE 重连之间的最小等待，避免连接抖动时疯狂重连。线性 backoff 上限。
 const RECONNECT_BASE_MS = 2_000;
@@ -57,8 +97,23 @@ async function deliverEventToHooks(args: {
   event: any;
   logger: NonNullable<PluginServiceContext['logger']>;
 }): Promise<{ ok: boolean; status: number; body: string }> {
+  // 选择性 sessionKey override：只有 install_welcome_recommendation 这种"安装欢迎"
+  // 一次性事件，强制落到用户当前 chat（让用户立刻看到 Hi 推的人，避免装完空白流失）。
+  // 其他常规 push 不传 session_key，让 OpenClaw 默认 hook:<uuid> 路径处理。
+  let payloadConfig: { session_key?: string } | null = null;
+  if (shouldRouteToUserCurrentChat(args.event)) {
+    const sk = findRecentUserSessionKey();
+    if (sk) {
+      payloadConfig = { session_key: sk };
+      args.logger.info?.('[hi-openclaw-plugin] routing install_welcome push to user current chat', {
+        session_key: sk, kind: args.event?.payload?.kind,
+      });
+    } else {
+      args.logger.warn?.('[hi-openclaw-plugin] install_welcome push: no recent non-hook session found, falling back to default hook routing');
+    }
+  }
   // 投递 hook payload：跟老 receiver 完全同形态。
-  const body = buildOpenClawHookPayloadWithRoute({ event: args.event, config: null });
+  const body = buildOpenClawHookPayloadWithRoute({ event: args.event, config: payloadConfig });
   const response = await fetch(args.hooksUrl, {
     method: 'POST',
     headers: {

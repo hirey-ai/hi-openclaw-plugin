@@ -51,8 +51,16 @@ function mergePrefixes(current: unknown, activeAgentPrefix: string): string[] {
       if (typeof entry === 'string' && entry.trim()) set.add(entry.trim());
     }
   }
+  // hook:* — 默认 isolated hook session 路径（大多数 push 走这条）
   set.add('hook:');
+  // agent:active:* — OpenClaw 老 active-agent 路由 prefix（保留兼容）
   set.add(activeAgentPrefix);
+  // agent:* — 让 plugin daemon 把 install_welcome 这种"展示给用户"push 直接落到用户当前
+  // 主 chat（agent:main:explicit:<uuid> / agent:main:main 等），OpenClaw hooks adapter 才不
+  // 会拒掉这些 sessionKey。如果不放开这条 prefix，daemon override 的 sessionKey 会被
+  // resolveHookSessionKey 当成 disallowed fallback 回 hook:<uuid>，导致 push 又跑回独立
+  // session 用户看不到。
+  set.add('agent:');
   return Array.from(set);
 }
 
