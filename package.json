@@ -1,13 +1,13 @@
 {
   "name": "hirey",
-  "version": "1.0.9",
+  "version": "1.0.10",
   "repository": {
     "type": "git",
     "url": "https://github.com/hirey-ai/hi-openclaw-plugin.git"
   },
   "homepage": "https://github.com/hirey-ai/hi-openclaw-plugin#readme",
   "license": "UNLICENSED",
-  "description": "Hirey Hi as a native OpenClaw plugin: registers Hi tools, the agent-events claim service, and webhook ingress directly inside the gateway process \u2014 zero independent daemons, no `mcp.servers.hi` indirection, no per-run frozen tool inventory boundary. Same business logic as @hirey/hi-mcp-server / @hirey/hi-agent-receiver, but wired through OpenClaw's native register(api) instead of stdio MCP + spawned daemon. For OpenClaw 5.x; pre-5.x users keep using the ClawHub bundle path.",
+  "description": "Hirey Hi as a native OpenClaw plugin: registers Hi tools, the agent-events claim service, and webhook ingress directly inside the gateway process \u2014 zero independent daemons, no `mcp.servers.hi` indirection, no per-run frozen tool inventory boundary. Same business logic as @hirey/hi-mcp-server / @hirey/hi-agent-receiver, but wired through OpenClaw's native register(api) instead of stdio MCP + spawned daemon. For OpenClaw 5.4+; OpenClaw 4.23 ~ 5.3 users install the prod ClawHub bundle clawhub:hirey-compatible instead.",
   "private": false,
   "type": "module",
   "main": "dist/index.js",
@@ -34,7 +34,8 @@
       "openclawVersion": "2026.5.6"
     },
     "install": {
-      "minHostVersion": ">=2026.4.23"
+      "minHostVersion": ">=2026.5.4",
+      "minHostVersionComment": "实测过：OpenClaw 4.23 / 4.25 装 ClawPack 报 'requires plugin API 1.0, but this OpenClaw runtime exposes 2026.4.x'（4.x runtime 还在用日期格式版本号，不接受语义化 pluginApi=1.0）；5.2 装报 'missing sha256hash and usable files[] metadata for fallback archive verification'（ClawHub server 没给老 5.2 客户端兜底 metadata）。最早能稳装 ClawPack 的 OpenClaw 是 5.4。4.23 ~ 5.3 用户装 prod bundle clawhub:hirey-compatible 走 zip 路径。"
     }
   },
   "scripts": {

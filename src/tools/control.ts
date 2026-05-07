@@ -197,17 +197,22 @@ export function buildHiAgentInstallTool(config: Required<HiOpenClawPluginConfig>
         }
 
         // Step 4: declare delivery capabilities + bind session
-        // Native plugin 模式下，user host 在 NAT 后面，公网 hi platform 推不到 localhost；
-        // 所以唯一真实工作的 delivery 是 pull_stream（plugin 内的 agent-events service 主动从
-        // 平台拉 event）。webhook 路由仍然挂在 gateway 上 (registerHttpRoute) 但只供同机内 curl
-        // 自测，不暴露给平台。
+        // Native plugin 跑在用户本机的 OpenClaw gateway 进程内，daemon 主动从平台 SSE / claim
+        // 拉事件再 POST hooks/agent —— 这在 hi 平台业务定义上等价于"本机 receiver daemon"。
+        // 因此声明 local_receiver（让 hi 平台的 bootstrap install_welcome_recommendation 等
+        // 业务 push gate 把我们识别为可送达的 host receiver）+ pull_stream（声明 SSE 这条主路径）
+        // + claim_ack（声明 fallback 路径）。preferred=local_receiver 跟老 hi-agent-receiver
+        // 的官方语义对齐，让平台业务层对我们的对待跟传统 receiver 完全一致。
+        //
         // 注意 platform schema 约束：route_missing_policy=use_explicit_default_route 必须搭配
         // 实际的 default_reply_route 对象；没 host_session_key 时直接 omit 这两个字段，让平台走
         // 默认 (route_missing_policy=use_last_active_session) 兜底。
         const deliveryCapsBody: Record<string, unknown> = {
-          preferred: 'pull_stream',
+          preferred: 'local_receiver',
           capabilities: [
+            { kind: 'local_receiver', status: 'active', config: {} },
             { kind: 'pull_stream', status: 'active', config: {} },
+            { kind: 'claim_ack', status: 'active', config: {} },
           ],
         };
         if (args.host_session_key) {
