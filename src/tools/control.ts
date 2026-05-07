@@ -196,14 +196,14 @@ export function buildHiAgentInstallTool(config: Required<HiOpenClawPluginConfig>
         }
 
         // Step 4: declare delivery capabilities + bind session
-        // 在 native plugin 模式下，事件是通过 plugin 自己 register 的 webhook route 跟 service 投递的，
-        // 不再需要外部 receiver daemon 也不再需要 OpenClaw hooks token 那一套间接层。
-        // delivery_capabilities 声明 generic_webhook 指向 plugin 自己的 /<webhook_path>。
+        // Native plugin 模式下，user host 在 NAT 后面，公网 hi platform 推不到 localhost；
+        // 所以唯一真实工作的 delivery 是 pull_stream（plugin 内的 agent-events service 主动从
+        // 平台拉 event）。webhook 路由仍然挂在 gateway 上 (registerHttpRoute) 但只供同机内 curl
+        // 自测，不暴露给平台。所以这里只声明 pull_stream，preferred 也是 pull_stream。
         const installationUpdate = await auth.gateway.updateInstallation({
           delivery_capabilities: {
-            preferred: 'generic_webhook',
+            preferred: 'pull_stream',
             capabilities: [
-              { kind: 'generic_webhook', status: 'active', config: { url: 'plugin-internal:' + config.webhookPath } },
               { kind: 'pull_stream', status: 'active', config: {} },
             ],
             route_missing_policy: 'use_explicit_default_route',
