@@ -1,0 +1,82 @@
+{
+  "id": "hi-openclaw-plugin",
+  "name": "Hirey Hi",
+  "description": "Hirey Hi for OpenClaw — register Hi's tools, agent-events claim service, and webhook ingress in-process. People-to-people matching for jobs, hiring, housing, friendship, dating, founders, investors, lawyers, and any other human-lead goal.",
+  "version": "0.1.0",
+  "kind": "service",
+  "activation": {
+    "onStartup": true,
+    "onCapabilities": ["tool", "service"],
+    "onCommands": []
+  },
+  "contracts": {
+    "tools": [
+      "hi_agent_status",
+      "hi_agent_doctor",
+      "hi_agent_install",
+      "hi_agent_reset",
+      "agent_listings",
+      "matching_sessions",
+      "pairings",
+      "thread_meetings",
+      "conversations",
+      "listing_taxonomy",
+      "agent_credits",
+      "content_get",
+      "content_render",
+      "faq_get",
+      "faq_search",
+      "social_org",
+      "social_permissions",
+      "social_relationships"
+    ]
+  },
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "platformBaseUrl": {
+        "type": "string",
+        "description": "Hirey Hi platform base URL. Defaults to the Hirey AI public service.",
+        "default": "https://hi.hirey.ai"
+      },
+      "profile": {
+        "type": "string",
+        "description": "Hi MCP profile name. Used to namespace persisted identity / receiver state on disk.",
+        "default": "openclaw-main"
+      },
+      "stateDir": {
+        "type": "string",
+        "description": "Filesystem dir for persisted hi identity / receiver runtime cursor. Default ~/.openclaw/hi-mcp/<profile>.",
+        "default": ""
+      },
+      "webhookPath": {
+        "type": "string",
+        "description": "Plugin-owned HTTP path on the gateway where the in-process receiver service delivers Hi events back into the current LLM session. Default /hi/webhook.",
+        "default": "/hi/webhook"
+      },
+      "claimPollIntervalMs": {
+        "type": "integer",
+        "description": "How often the in-process agent-events claim loop polls the platform when the long-poll connection is idle.",
+        "default": 1500,
+        "minimum": 250
+      },
+      "claimLeaseMs": {
+        "type": "integer",
+        "description": "Per-claim lease length the loop requests from the platform.",
+        "default": 60000,
+        "minimum": 1000
+      }
+    }
+  },
+  "uiHints": {
+    "platformBaseUrl": {
+      "label": "Platform base URL",
+      "placeholder": "https://hi.hirey.ai"
+    },
+    "profile": {
+      "label": "Hi MCP profile",
+      "placeholder": "openclaw-main"
+    }
+  }
+}
