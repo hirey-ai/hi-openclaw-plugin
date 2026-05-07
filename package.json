@@ -1,5 +1,5 @@
 {
-  "name": "hirey",
+  "name": "@hirey/hirey",
   "version": "1.0.13",
   "repository": {
     "type": "git",
@@ -7,7 +7,7 @@
   },
   "homepage": "https://github.com/hirey-ai/hi-openclaw-plugin#readme",
   "license": "UNLICENSED",
-  "description": "Hirey Hi as a native OpenClaw plugin: registers Hi tools, the agent-events claim service, and webhook ingress directly inside the gateway process \u2014 zero independent daemons, no `mcp.servers.hi` indirection, no per-run frozen tool inventory boundary. Same business logic as @hirey/hi-mcp-server / @hirey/hi-agent-receiver, but wired through OpenClaw's native register(api) instead of stdio MCP + spawned daemon. For OpenClaw 5.4+ via ClawPack `clawhub:hirey`; for OpenClaw 5.2 ~ 5.3 via npm fallback `npm install hirey` / `openclaw plugins install npm:hirey` (same code, ClawPack metadata path is broken on 5.2 ~ 5.3 ClawHub clients so we expose the unscoped npm name `hirey` so a bare `openclaw plugins install hirey` lands here when ClawHub fails). OpenClaw 4.23 ~ 5.1 must use the prod ClawHub bundle `clawhub:hirey-compatible` because their runtime expects date-format `compat.pluginApi` and rejects newer ranges.",
+  "description": "Hirey Hi as a native OpenClaw plugin: registers Hi tools, the agent-events claim service, and webhook ingress directly inside the gateway process \u2014 zero independent daemons, no `mcp.servers.hi` indirection, no per-run frozen tool inventory boundary. Same business logic as @hirey/hi-mcp-server / @hirey/hi-agent-receiver, but wired through OpenClaw's native register(api) instead of stdio MCP + spawned daemon. For OpenClaw 5.4+ via ClawPack `clawhub:hirey`; for OpenClaw 5.2 ~ 5.3 via npm fallback `openclaw plugins install npm:@hirey-ai/hirey` (same plugin code, ClawPack metadata path is broken on 5.2 ~ 5.3 ClawHub clients so we ship the same tarball through npm under the brand-name `@hirey-ai/hirey` for prod / `@hirey/hirey` for early — npm `hirey` (unscoped) was rejected by npm typosquatting policy). OpenClaw 4.23 ~ 5.1 must use the prod ClawHub bundle `clawhub:hirey-compatible` because their runtime expects date-format `compat.pluginApi` and rejects newer ranges.",
   "private": false,
   "type": "module",
   "main": "dist/index.js",
