@@ -9,6 +9,7 @@
 import type { PluginServiceContext, PluginServiceDefinition, HiOpenClawPluginConfig } from '../types.js';
 import { buildAuthorizedClients, peekQuarantineNotice } from '../clients.js';
 import { resolveStateDir, updateState } from '../state.js';
+import { pushEventToQueue } from '../routes/webhook.js';
 
 export function buildAgentEventsService(config: Required<HiOpenClawPluginConfig>): PluginServiceDefinition {
   const stateDir = config.stateDir || resolveStateDir(config.profile);
@@ -46,18 +47,12 @@ export function buildAgentEventsService(config: Required<HiOpenClawPluginConfig>
               first_topic: items[0]?.topic,
               first_event_id: items[0]?.event_id,
             });
-            // 把 events 通过 plugin 自己的 webhook route 投递（loopback）。
-            // OpenClaw gateway HTTP server 监听端口同进程内可访问。
-            const gatewayPort = process.env.OPENCLAW_GATEWAY_PORT || '18789';
+            // 进程内直推 event 到 webhook queue（同一 plugin 内部，不走 fetch，也不读 env，
+            // 避开 OpenClaw install scanner 的 "credential harvesting (env + network)" 误报）。
             for (const ev of items) {
-              try {
-                await fetch(`http://127.0.0.1:${gatewayPort}${config.webhookPath}`, {
-                  method: 'POST',
-                  headers: { 'content-type': 'application/json' },
-                  body: JSON.stringify(ev),
-                });
-              } catch (err: any) {
-                logger.warn?.('[hi-openclaw-plugin] webhook loopback delivery failed', { error: String(err?.message || err) });
+              try { pushEventToQueue(ev as Record<string, unknown>); }
+              catch (err: any) {
+                logger.warn?.('[hi-openclaw-plugin] queue push failed', { error: String(err?.message || err) });
               }
             }
             // ack consumed events back to platform

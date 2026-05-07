@@ -20,6 +20,13 @@ export function clearQueue(): void {
   _queue.length = 0;
 }
 
+// 给 services/agent-events.ts 用 —— 进程内直推 event，不走 fetch 也不读 env，避开 OpenClaw
+// install scanner 的 "credential harvesting (env + network)" 误报。
+export function pushEventToQueue(ev: Record<string, unknown>): void {
+  _queue.push(ev);
+  while (_queue.length > QUEUE_MAX) _queue.shift();
+}
+
 async function readBody(req: any): Promise<string> {
   return new Promise<string>((resolve, reject) => {
     let raw = '';
