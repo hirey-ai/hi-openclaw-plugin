@@ -17,6 +17,7 @@ import { buildAllControlTools } from './tools/control.js';
 import { buildAllCapabilityTools } from './tools/capabilities.js';
 import { buildAgentEventsService } from './services/agent-events.js';
 import { buildWebhookRoute } from './routes/webhook.js';
+import { ensurePluginToolsAlsoAllowed } from './utils/openclaw-config.js';
 
 const _registeredApis = new WeakSet<PluginRegisterApi>();
 
@@ -81,6 +82,28 @@ export default function registerHiOpenClawPlugin(api: PluginRegisterApi): void {
   if (typeof api.registerHttpRoute === 'function') {
     api.registerHttpRoute(buildWebhookRoute(config, logger));
   }
+
+  // ---- profile self-heal ----
+  // OpenClaw 的 tools.profile=coding 默认不让 plugin tools 出现在 LLM 的 toolbox。要让用户
+  // 装完 plugin 立刻可用，第一次 register 时主动检查 + patch tools.alsoAllow 加 group:plugins。
+  // 这件事不能等 LLM 调 hi_agent_install 时才做：那时 LLM 早已没看见 hi_agent_install。
+  // 也不能依赖 LLM 自己读懂 OpenClaw 配置语义后改：之前实测 LLM 把 alsoAllow 写成 allow，
+  // explicit allow override 把 read/exec/sessions_* 等内置工具全 filter 掉，整个 LLM run 没工具用。
+  // 因此 plugin 自己幂等 patch，atomic write，patch 完不立刻 restart gateway —— config hot-reload
+  // watcher 会自然 pick up，下一个 LLM session 起来 tool inventory 就 contains hi_*。
+  void ensurePluginToolsAlsoAllowed()
+    .then((res) => {
+      if (res.changed) {
+        logger.info?.('[hi-openclaw-plugin] auto-patched tools.alsoAllow=group:plugins so plugin tools become visible to LLM in coding profile', {
+          before: res.also_allow_before, after: res.also_allow_after,
+        });
+      }
+    })
+    .catch((err: any) => {
+      logger.warn?.('[hi-openclaw-plugin] tools.alsoAllow auto-patch failed (LLM may need to do it manually)', {
+        error: String(err?.message || err),
+      });
+    });
 
   logger.info?.(
     '[hi-openclaw-plugin] registered v1.0.0',
