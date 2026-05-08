@@ -7,6 +7,13 @@
 // 2. 缺能力 fail-soft：老 host 可能没 registerService 或 registerHttpRoute；feature-detect 后
 //    skip + warn，不要 throw 让 host 起不来。
 // 3. 真业务全部委托给 @hirey/hi-agent-sdk + 平台 /v1/capabilities/<id>/call，本文件只做 wiring。
+// 4. capability tool schema 不在 plugin 内部 hardcode：从 prod /v1/capabilities 拉 PublicAgentCapability
+//    列表，原样把 capability.parameters 当 OpenClaw tool parameters 用。一处对齐 prod，14 个 tool
+//    全部受益，未来平台加新 capability 也不用改 plugin。
+//    这一段是 async fetch；OpenClaw 的 register(api) 类型是 sync，但运行时支持 async / await：
+//    plugin loader 在 dynamic import 后会 `await register(api)`（实测兼容 Promise<void>）。这里
+//    显式 await，防止"factory 已被注册但 schema 还没拉到" 的窗口让 LLM 看到空 schema 又调出
+//    "unsupported action"。
 
 import type {
   PluginRegisterApi,
@@ -14,7 +21,7 @@ import type {
   HiOpenClawPluginConfig,
 } from './types.js';
 import { buildAllControlTools } from './tools/control.js';
-import { buildAllCapabilityTools } from './tools/capabilities.js';
+import { buildAllCapabilityTools, fetchPublicCapabilities } from './tools/capabilities.js';
 import { buildAgentEventsService } from './services/agent-events.js';
 import { buildWebhookRoute } from './routes/webhook.js';
 import { ensurePluginToolsAlsoAllowed } from './utils/openclaw-config.js';
@@ -32,7 +39,7 @@ function defaultedConfig(raw: HiOpenClawPluginConfig | undefined): Required<HiOp
   };
 }
 
-export default function registerHiOpenClawPlugin(api: PluginRegisterApi): void {
+export default async function registerHiOpenClawPlugin(api: PluginRegisterApi): Promise<void> {
   if (_registeredApis.has(api)) return;
   _registeredApis.add(api);
 
@@ -50,15 +57,34 @@ export default function registerHiOpenClawPlugin(api: PluginRegisterApi): void {
     );
   } else {
     const controlTools = buildAllControlTools(config);
-    const capabilityTools = buildAllCapabilityTools(config);
-    const allTools: PluginToolDefinition[] = [...controlTools, ...capabilityTools];
-    for (const tool of allTools) {
-      api.registerTool(
-        () => tool,
-        { names: [tool.name] },
+    // 控制工具不依赖 platform，先注册掉；capability 工具要等 schema 拉到才能注册，避免
+    // 先用空 schema 注册再被 OpenClaw / OpenAI strict mode 静默剥掉所有 properties，
+    // 调用方传 action 等字段被丢，落到平台时变成空 args 报 "unsupported action"。
+    for (const tool of controlTools) {
+      api.registerTool(() => tool, { names: [tool.name] });
+    }
+    try {
+      const capabilitySpecs = await fetchPublicCapabilities(config.platformBaseUrl);
+      const capabilityTools = buildAllCapabilityTools(config, capabilitySpecs);
+      for (const tool of capabilityTools) {
+        api.registerTool(() => tool, { names: [tool.name] });
+      }
+      const allTools: PluginToolDefinition[] = [...controlTools, ...capabilityTools];
+      logger.info?.('[hi-openclaw-plugin] registered tools', {
+        count: allTools.length,
+        control_tools: controlTools.map(t => t.name),
+        capability_tools: capabilityTools.map(t => t.name),
+        capability_schema_source: `${config.platformBaseUrl}/v1/capabilities`,
+      });
+    } catch (err: any) {
+      // platform 不可达 / contract 异常 —— capability tool 无法拿到 schema，不能用 hardcoded
+      // 兜底（schema 不一致比工具缺席更危险，会让 LLM 在 owner 面前幻觉调用形态）。这里只
+      // 注册控制工具，业务工具留空，让 owner 通过 hi_agent_doctor / hi_agent_status 看到为什么。
+      logger.error?.(
+        '[hi-openclaw-plugin] failed to fetch platform capability schemas; capability tools will NOT be registered. Resolve network/platform reachability and reload the plugin.',
+        { platform_base_url: config.platformBaseUrl, error: String(err?.message || err) },
       );
     }
-    logger.info?.('[hi-openclaw-plugin] registered tools', { count: allTools.length, names: allTools.map(t => t.name) });
   }
 
   // ---- service / route ----
@@ -106,7 +132,7 @@ export default function registerHiOpenClawPlugin(api: PluginRegisterApi): void {
     });
 
   logger.info?.(
-    '[hi-openclaw-plugin] registered v1.0.0',
+    '[hi-openclaw-plugin] register complete',
     { platform: config.platformBaseUrl, profile: config.profile, webhook: config.webhookPath },
   );
 }
