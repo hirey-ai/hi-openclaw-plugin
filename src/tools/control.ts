@@ -19,6 +19,7 @@ import {
   type HiIdentityState,
 } from '../state.js';
 import { ensureOpenClawHooksConfigured, ensurePluginToolsAlsoAllowed, readGatewayPort } from '../utils/openclaw-config.js';
+import { buildErrorDetailFields } from '../utils/error-detail.js';
 import fs from 'node:fs/promises';
 
 function defaultStateDir(config: Required<HiOpenClawPluginConfig>): string {
@@ -98,7 +99,7 @@ export function buildHiAgentStatusTool(config: Required<HiOpenClawPluginConfig>)
         }
         return asJsonResult(summary);
       } catch (err: any) {
-        return asErrorResult('hi_agent_status_failed', { detail: String(err?.message || err) });
+        return asErrorResult('hi_agent_status_failed', buildErrorDetailFields(err));
       }
     },
   };
@@ -323,7 +324,10 @@ export function buildHiAgentInstallTool(config: Required<HiOpenClawPluginConfig>
           },
         });
       } catch (err: any) {
-        return asErrorResult('hi_agent_install_failed', { detail: String(err?.message || err), stack: err?.stack });
+        return asErrorResult('hi_agent_install_failed', {
+          ...buildErrorDetailFields(err),
+          stack: err?.stack,
+        });
       }
     },
   };
@@ -413,7 +417,7 @@ export function buildHiAgentDoctorTool(config: Required<HiOpenClawPluginConfig>)
           delivery_probe: deliveryProbe,
         });
       } catch (err: any) {
-        return asErrorResult('hi_agent_doctor_failed', { detail: String(err?.message || err) });
+        return asErrorResult('hi_agent_doctor_failed', buildErrorDetailFields(err));
       }
     },
   };
@@ -447,7 +451,7 @@ export function buildHiAgentResetTool(config: Required<HiOpenClawPluginConfig>):
         }
         return asJsonResult({ ok: true, cleared: args.clear_state !== false, state_file: file });
       } catch (err: any) {
-        return asErrorResult('hi_agent_reset_failed', { detail: String(err?.message || err) });
+        return asErrorResult('hi_agent_reset_failed', buildErrorDetailFields(err));
       }
     },
   };
@@ -523,7 +527,7 @@ export function buildHiPullEventsTool(config: Required<HiOpenClawPluginConfig>):
           claim_lease_id: claim.claim_lease_id ?? null,
         });
       } catch (err: any) {
-        return asErrorResult('hi_pull_events_failed', { detail: String(err?.message || err) });
+        return asErrorResult('hi_pull_events_failed', buildErrorDetailFields(err));
       }
     },
   };

@@ -9,6 +9,7 @@
 import type { PluginToolDefinition, PluginToolResult, HiOpenClawPluginConfig } from '../types.js';
 import { buildAuthorizedClients } from '../clients.js';
 import { resolveStateDir } from '../state.js';
+import { buildErrorDetailFields } from '../utils/error-detail.js';
 
 type CapabilitySpec = {
   capability_id: string;
@@ -86,10 +87,13 @@ function buildCapabilityTool(spec: CapabilitySpec, config: Required<HiOpenClawPl
         const result = await auth.platform.callCapability(spec.capability_id, (params || {}) as Record<string, unknown>);
         return asJsonResult({ ok: true, ...(result as Record<string, unknown>), capability_id: spec.capability_id });
       } catch (err: any) {
-        // 平台返回 422 的话 err.message 通常含 invalid_<...> + path 信息，直接 surface 给 LLM。
+        // 平台 4xx 的诊断 detail 全在 err.detail.data 里（缺哪个字段 / required_for_action /
+        // enum 候选值等），err.message 只是 body.error 字段的一句话。早先这里只 surface
+        // err.message，等同于把诊断 swallow 掉——LLM 收到 tool result 只剩"missing fields"
+        // 一句话，不知道缺哪个字段，在 owner 面前盲调死循环。详见 utils/error-detail.ts。
         return asErrorResult('capability_call_failed', {
           capability_id: spec.capability_id,
-          detail: String(err?.message || err),
+          ...buildErrorDetailFields(err),
         });
       }
     },
