@@ -76,12 +76,20 @@ function findRecentUserSessionKey(): string | null {
 // 同样必须落到用户当前 chat（不要走 isolated hook:* session），否则 owner 在主对话窗
 // 看不到 onboarding 跟"装完没引导"心智上等价。
 //
+// category_match_notification（2026-05 新增）：平台主动撮合 lane 推给双方各一条
+// "Hi 帮你找到一个潜在朋友/合作对象/...，要不要 Hi 代你打个招呼"消息。push 内容里
+// 直接包含对方 listing 的 preview text + 平台 LLM 给出的 rationale + 给 LLM 的
+// instruction，owner 看到后能立刻决定要不要进入 contact_match。这是平台**主动**
+// 跟 owner 说话的场景，必须落到主对话窗（user 当前 chat）才让 owner 看到，否则
+// 跟"什么都没发生"心智等价，撮合 lane 就废了。
+//
 // 不同 kind 走 user-current-chat 的判定要扩展时**必须更新 reverse-dedup 文档**：use
 // SKILL 那边收到这两条 push 的处理 + dedup 规则要保持同步。
 function shouldRouteToUserCurrentChat(event: any): boolean {
   const kind = event?.payload?.kind;
   return kind === 'install_welcome_recommendation'
-    || kind === 'install_welcome_onboarding';
+    || kind === 'install_welcome_onboarding'
+    || kind === 'category_match_notification';
 }
 
 // SSE 重连之间的最小等待，避免连接抖动时疯狂重连。线性 backoff 上限。
