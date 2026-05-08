@@ -65,11 +65,23 @@ function findRecentUserSessionKey(): string | null {
 }
 
 // 哪些 event topics + payload kind 应该被强制落到 user 当前 chat。
-// 当前只有 install_welcome_recommendation 一种 — 它是用户安装完毕后的"第一印象"消息，
-// 必须立即看到才不会让 owner 觉得"装完没事干"流失。
+//
+// install_welcome_recommendation：用户安装完毕后的"第一印象"消息，必须立即看到才不会让
+// owner 觉得"装完没事干"流失。
+//
+// install_welcome_onboarding（2026-05 新增）：跟 recommendation 互补的"主动问 owner 在
+// 找什么样的人"引导消息。这条 push 是存量 agent 覆盖路径——install 同步路径只能让新装
+// 用户在 hi_agent_install 工具 result 里看到 welcome，存量 agent（在新版部署之前已经
+// 装好的）必须靠 platform 端 bootstrapOnboardingFanOutWorker 异步推这条 push 来补发。
+// 同样必须落到用户当前 chat（不要走 isolated hook:* session），否则 owner 在主对话窗
+// 看不到 onboarding 跟"装完没引导"心智上等价。
+//
+// 不同 kind 走 user-current-chat 的判定要扩展时**必须更新 reverse-dedup 文档**：use
+// SKILL 那边收到这两条 push 的处理 + dedup 规则要保持同步。
 function shouldRouteToUserCurrentChat(event: any): boolean {
   const kind = event?.payload?.kind;
-  return kind === 'install_welcome_recommendation';
+  return kind === 'install_welcome_recommendation'
+    || kind === 'install_welcome_onboarding';
 }
 
 // SSE 重连之间的最小等待，避免连接抖动时疯狂重连。线性 backoff 上限。
@@ -120,11 +132,13 @@ async function deliverEventToHooks(args: {
     const sk = findRecentUserSessionKey();
     if (sk) {
       payloadConfig = { session_key: sk };
-      args.logger.info?.('[hi-openclaw-plugin] routing install_welcome push to user current chat', {
+      args.logger.info?.('[hi-openclaw-plugin] routing install-welcome push to user current chat', {
         session_key: sk, kind: args.event?.payload?.kind,
       });
     } else {
-      args.logger.warn?.('[hi-openclaw-plugin] install_welcome push: no recent non-hook session found, falling back to default hook routing');
+      args.logger.warn?.('[hi-openclaw-plugin] install-welcome push: no recent non-hook session found, falling back to default hook routing', {
+        kind: args.event?.payload?.kind,
+      });
     }
   }
   // 投递 hook payload：跟老 receiver 完全同形态。
