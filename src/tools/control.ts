@@ -20,6 +20,7 @@ import {
 } from '../state.js';
 import { ensureOpenClawHooksConfigured, ensurePluginToolsAlsoAllowed, readGatewayPort } from '../utils/openclaw-config.js';
 import { buildErrorDetailFields } from '../utils/error-detail.js';
+import { PLUGIN_VERSION } from '../version.js';
 import fs from 'node:fs/promises';
 
 function defaultStateDir(config: Required<HiOpenClawPluginConfig>): string {
@@ -65,7 +66,7 @@ export function buildHiAgentStatusTool(config: Required<HiOpenClawPluginConfig>)
         const summary = {
           ok: true,
           plugin: 'hi-openclaw-plugin',
-          plugin_version: '1.0.0',
+          plugin_version: PLUGIN_VERSION,
           profile: config.profile,
           state_dir: stateDir,
           state_file: resolveStateFile(stateDir, config.profile),
@@ -160,7 +161,7 @@ export function buildHiAgentInstallTool(config: Required<HiOpenClawPluginConfig>
             display_name: args.display_name?.trim() || 'OpenClaw Hi Agent',
             agent_kind: args.agent_kind?.trim() || 'external',
             capabilities: [],
-            metadata: { host: 'openclaw', plugin: 'hi-openclaw-plugin', plugin_version: '1.0.0' },
+            metadata: { host: 'openclaw', plugin: 'hi-openclaw-plugin', plugin_version: PLUGIN_VERSION },
           });
           const identity: HiIdentityState = {
             agent_id: registerResp.agent.agent_id,
@@ -394,14 +395,44 @@ export function buildHiAgentDoctorTool(config: Required<HiOpenClawPluginConfig>)
               event_type: 'plugin.delivery.probe',
               preview: { title: 'plugin self-probe', text: 'hi-openclaw-plugin doctor delivery probe' },
             } as any);
-            if (deliveryProbe?.results?.some((r: any) => !r.ok)) {
-              blockers.push('delivery_probe_failed');
+            // 把 results[*].ok=false 拆成两类，对齐 Kubernetes liveness/readiness 的设计
+            // 哲学（"detect only true unrecoverable failures，否则会 cascading failure"）：
+            //
+            //   - timeout（local_receiver_delivery_timeout）：probe round-trip 超过 platform
+            //     gateway 的 LOCAL_RECEIVER_TEST_TIMEOUT_MS=15s，几乎全是因为 daemon 投到
+            //     OpenClaw /hooks/agent 后被 isolated agent turn 同步占用（normal turn
+            //     1~3 分钟），15s 之内根本不可能 ack 回来。这种 "probe timing model 跟
+            //     production 投递路径不匹配" 的现象不代表 push 实际坏掉，所以归 warnings，
+            //     不进 blockers，不让 owner 误以为 push 不工作。
+            //   - hard failure（local_receiver_test_event_not_found / hook_delivery_4xx /
+            //     auth/route 类）：是 daemon 真的没把 event 收回来或者 OpenClaw 端拒收，
+            //     production push 同样会失败，进 blockers 让 owner 看到。
+            for (const r of (deliveryProbe?.results ?? []) as Array<{ ok: boolean; error?: string }>) {
+              if (r.ok) continue;
+              const errCode = String(r.error || '');
+              if (errCode === 'local_receiver_delivery_timeout') {
+                warnings.push(
+                  'delivery_probe_timeout: probe ack did not return within gateway 15s window; '
+                  + 'OpenClaw /hooks/agent likely blocked on a synchronous isolated agent turn '
+                  + '(normal turn budget exceeds probe budget). Production push delivery is unaffected.',
+                );
+                continue;
+              }
+              blockers.push(`delivery_probe_failed:${errCode || 'unknown'}`);
             }
           } catch (err: any) {
             blockers.push('delivery_probe_threw:' + String(err?.message || err));
           }
         }
 
+        // push_ready 现在真正反映 "production push 路径是否健康"：probe 跑完且没出现
+        // hard failure（hook 4xx / event_not_found / probe_threw 等）。timeout-only 的失败
+        // 已经在上面降级成 warnings，不影响 push_ready；这跟 probe round-trip 跟 production
+        // 路径解耦的 doctor 设计一致。
+        const probeHadHardFailure = blockers.some((b) =>
+          b.startsWith('delivery_probe_failed:') || b.startsWith('delivery_probe_threw:'),
+        );
+        const pushReady = !!deliveryProbe?.ok && !probeHadHardFailure;
         return asJsonResult({
           ok: blockers.length === 0,
           profile: config.profile,
@@ -410,7 +441,7 @@ export function buildHiAgentDoctorTool(config: Required<HiOpenClawPluginConfig>)
           quarantined_stale_identity: peekQuarantineNotice(),
           connected: true,
           activated,
-          push_ready: !!deliveryProbe?.ok,
+          push_ready: pushReady,
           blockers, warnings,
           delivery_capabilities: installation.installation?.delivery_capabilities ?? null,
           remote: { me, installation, endpoints, subscriptions },

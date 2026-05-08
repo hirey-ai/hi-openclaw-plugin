@@ -77,6 +77,21 @@ const RECONNECT_BASE_MS = 2_000;
 const RECONNECT_MAX_MS = 30_000;
 // 没装 identity / hooks 配置时的 idle backoff。daemon 不会强求 install，等 install_tool 跑完。
 const IDLE_BACKOFF_MS = 30_000;
+// 单次 hooks/agent 投递的硬上限（毫秒）。OpenClaw 的 /hooks/agent 端点是同步的：收到
+// payload 后会同步驱动 isolated agent turn 直到 LLM 跑完才返回 200。正常 turn 上界
+// 大概 1~3 分钟（含工具调用 + LLM 推理 + channel send-back），5 分钟覆盖到所有合理的
+// 慢 turn。超过这个时间几乎一定意味着 OpenClaw 端 hook handler 出问题（死锁 / runner
+// 卡住 / 上游 LLM 网络挂），daemon 不能继续 hold 住它的 SSE 串行投递循环。
+//
+// 业界共识：Node 内置 fetch 没有默认 timeout，必须显式 AbortSignal.timeout（参考
+// PostHog#13309 把 webhook timeout 收紧防 cascading failure；Node fetch 官方惯例）。
+// 不设 timeout 的后果：一条卡死的 hook 会让 daemon 永远不前进，新 event 全部 backlog
+// 在平台 outbox 拉不下来 —— 这是一类失败拖死整个 owner-actionable event 流。
+//
+// 超时触发后 fetch throw AbortError，外层走 ack failed 路径（已经存在），平台按
+// retry_after_ms=60_000 重投。重投仍是同一 event_id，OpenClaw 端的 dispatchAgentHook
+// 自身有 idempotency 兜底，不会重复触发同一个 turn。
+const HOOKS_DELIVERY_TIMEOUT_MS = 5 * 60 * 1000;
 
 type DaemonRuntimeConfig = {
   hooks_token: string;
@@ -113,6 +128,9 @@ async function deliverEventToHooks(args: {
     }
   }
   // 投递 hook payload：跟老 receiver 完全同形态。
+  // 注意 fetch 的 signal：见 HOOKS_DELIVERY_TIMEOUT_MS 注释，5 分钟硬超时防止 OpenClaw 端
+  // hook handler 卡死把 daemon 串行投递循环拖死。abort 会让 fetch throw AbortError，外层
+  // deliverAndAck 的 catch 走 ack failed 路径（retry_after_ms=60_000），平台之后重投。
   const body = buildOpenClawHookPayloadWithRoute({ event: args.event, config: payloadConfig });
   const response = await fetch(args.hooksUrl, {
     method: 'POST',
@@ -121,6 +139,7 @@ async function deliverEventToHooks(args: {
       'authorization': `Bearer ${args.hooksToken}`,
     },
     body: JSON.stringify(body),
+    signal: AbortSignal.timeout(HOOKS_DELIVERY_TIMEOUT_MS),
   });
   const text = await response.text();
   if (!response.ok) {
