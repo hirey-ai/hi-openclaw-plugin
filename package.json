@@ -1,6 +1,6 @@
 {
   "name": "hirey",
-  "version": "1.0.19",
+  "version": "1.0.20",
   "repository": {
     "type": "git",
     "url": "https://github.com/hirey-ai/hi-openclaw-plugin.git"
@@ -43,8 +43,9 @@
     "clean": "node -e \"require('node:fs').rmSync('dist', { recursive: true, force: true })\"",
     "build": "npm run clean && tsc -p tsconfig.json",
     "dev": "tsc -p tsconfig.json --watch",
+    "snapshot": "node scripts/snapshot-capabilities.mjs",
     "test": "tsx --test src/**/*.test.ts",
-    "prepack": "npm run build"
+    "prepack": "npm run build && npm run snapshot"
   },
   "publishConfig": {
     "access": "public"

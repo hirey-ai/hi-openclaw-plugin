@@ -7,13 +7,17 @@
 // 2. 缺能力 fail-soft：老 host 可能没 registerService 或 registerHttpRoute；feature-detect 后
 //    skip + warn，不要 throw 让 host 起不来。
 // 3. 真业务全部委托给 @hirey/hi-agent-sdk + 平台 /v1/capabilities/<id>/call，本文件只做 wiring。
-// 4. capability tool schema 不在 plugin 内部 hardcode：从 prod /v1/capabilities 拉 PublicAgentCapability
-//    列表，原样把 capability.parameters 当 OpenClaw tool parameters 用。一处对齐 prod，14 个 tool
-//    全部受益，未来平台加新 capability 也不用改 plugin。
-//    这一段是 async fetch；OpenClaw 的 register(api) 类型是 sync，但运行时支持 async / await：
-//    plugin loader 在 dynamic import 后会 `await register(api)`（实测兼容 Promise<void>）。这里
-//    显式 await，防止"factory 已被注册但 schema 还没拉到" 的窗口让 LLM 看到空 schema 又调出
-//    "unsupported action"。
+// 4. **register 必须是同步函数**。OpenClaw v2026.4.23 起 plugin loader 用 runPluginRegisterSync
+//    调本入口（PR openclaw/openclaw#67941，CHANGELOG.md:707 "enforce synchronous plugin
+//    registration"），看到 register 返回 Promise 直接 throw "plugin register must be
+//    synchronous" 然后 plugin 整体 register 失败、所有 tool 注册不上。1.0.16 ~ 1.0.19 这段
+//    把 register 错误地改成 async function 跑 await fetchPublicCapabilities(...)，导致所有
+//    OpenClaw 4.23+ 用户装完插件 plugin doctor 报错、hi_* tool 全部不可用。1.0.20 起回到
+//    sync register。
+// 5. capability tool schema 来自 build-time snapshot：scripts/snapshot-capabilities.mjs 在
+//    npm prepack 时一次性 fetch prod /v1/capabilities 写到 dist/capabilities.snapshot.json，
+//    register 时同步 readFileSync 加载。register 阶段没有任何外部网络/磁盘 await，符合
+//    OpenClaw sync register 约束。详见 src/tools/capabilities.ts 文件头注释。
 
 import type {
   PluginRegisterApi,
@@ -21,7 +25,7 @@ import type {
   HiOpenClawPluginConfig,
 } from './types.js';
 import { buildAllControlTools } from './tools/control.js';
-import { buildAllCapabilityTools, fetchPublicCapabilities } from './tools/capabilities.js';
+import { buildAllCapabilityTools, loadCapabilitySnapshot } from './tools/capabilities.js';
 import { buildAgentEventsService } from './services/agent-events.js';
 import { buildWebhookRoute } from './routes/webhook.js';
 import { ensurePluginToolsAlsoAllowed } from './utils/openclaw-config.js';
@@ -30,6 +34,7 @@ const _registeredApis = new WeakSet<PluginRegisterApi>();
 
 function defaultedConfig(raw: HiOpenClawPluginConfig | undefined): Required<HiOpenClawPluginConfig> {
   return {
+    // 默认 prod URL；改这里时 scripts/snapshot-capabilities.mjs 的 PLATFORM_BASE_URL 也要同步改。
     platformBaseUrl: raw?.platformBaseUrl?.trim() || 'https://hi.hirey.ai',
     profile: raw?.profile?.trim() || 'openclaw-main',
     stateDir: raw?.stateDir?.trim() || '',
@@ -39,7 +44,7 @@ function defaultedConfig(raw: HiOpenClawPluginConfig | undefined): Required<HiOp
   };
 }
 
-export default async function registerHiOpenClawPlugin(api: PluginRegisterApi): Promise<void> {
+export default function registerHiOpenClawPlugin(api: PluginRegisterApi): void {
   if (_registeredApis.has(api)) return;
   _registeredApis.add(api);
 
@@ -51,40 +56,36 @@ export default async function registerHiOpenClawPlugin(api: PluginRegisterApi): 
   //   api.registerTool(factory: (ctx) => Tool | null, options: { names: [singleName] })
   // 每次调一个 tool。factory 在每个 LLM session 启动时被调一次，返回该 session 可见的 tool 实例
   // （可以根据 ctx.agentId / ctx.sessionKey 决定是否暴露）。这里我们让每个 hi tool 总是 visible（无 gating）。
+  //
+  // OpenClaw 5.2+ (PR #76079) 在 register 阶段会把 api.registerTool(...) 拿到的 tool descriptor
+  // cache 到 prompt-time planning 路径，运行时再 mutate descriptor 也不会被 LLM 看见——所以
+  // 必须在 register 这一刻就把所有 tool 用最终完整的 schema 一次性注册掉。
   if (typeof api.registerTool !== 'function') {
     logger.warn?.(
       '[hi-openclaw-plugin] host does not expose api.registerTool; tools will not be visible. Upgrade OpenClaw to >=2026.4.23.',
     );
   } else {
     const controlTools = buildAllControlTools(config);
-    // 控制工具不依赖 platform，先注册掉；capability 工具要等 schema 拉到才能注册，避免
-    // 先用空 schema 注册再被 OpenClaw / OpenAI strict mode 静默剥掉所有 properties，
-    // 调用方传 action 等字段被丢，落到平台时变成空 args 报 "unsupported action"。
+    // capability schema 从 dist/capabilities.snapshot.json 同步 load。snapshot 缺失/坏掉/为空
+    // 会 throw（loadCapabilitySnapshot 内部 fail-close），冒到 plugin loader 让 register 失败、
+    // host doctor 直接 surface — 而不是 silently 注册一组 hi_* tool 但少一半 capability。
+    // 不在这层 try/catch 把异常吞掉：snapshot 异常意味着 plugin tarball 自身坏了（snapshot
+    // build 时已经验过形态），偷偷续命比报错更危险。
+    const capabilitySpecs = loadCapabilitySnapshot();
+    const capabilityTools = buildAllCapabilityTools(config, capabilitySpecs);
     for (const tool of controlTools) {
       api.registerTool(() => tool, { names: [tool.name] });
     }
-    try {
-      const capabilitySpecs = await fetchPublicCapabilities(config.platformBaseUrl);
-      const capabilityTools = buildAllCapabilityTools(config, capabilitySpecs);
-      for (const tool of capabilityTools) {
-        api.registerTool(() => tool, { names: [tool.name] });
-      }
-      const allTools: PluginToolDefinition[] = [...controlTools, ...capabilityTools];
-      logger.info?.('[hi-openclaw-plugin] registered tools', {
-        count: allTools.length,
-        control_tools: controlTools.map(t => t.name),
-        capability_tools: capabilityTools.map(t => t.name),
-        capability_schema_source: `${config.platformBaseUrl}/v1/capabilities`,
-      });
-    } catch (err: any) {
-      // platform 不可达 / contract 异常 —— capability tool 无法拿到 schema，不能用 hardcoded
-      // 兜底（schema 不一致比工具缺席更危险，会让 LLM 在 owner 面前幻觉调用形态）。这里只
-      // 注册控制工具，业务工具留空，让 owner 通过 hi_agent_doctor / hi_agent_status 看到为什么。
-      logger.error?.(
-        '[hi-openclaw-plugin] failed to fetch platform capability schemas; capability tools will NOT be registered. Resolve network/platform reachability and reload the plugin.',
-        { platform_base_url: config.platformBaseUrl, error: String(err?.message || err) },
-      );
+    for (const tool of capabilityTools) {
+      api.registerTool(() => tool, { names: [tool.name] });
     }
+    const allTools: PluginToolDefinition[] = [...controlTools, ...capabilityTools];
+    logger.info?.('[hi-openclaw-plugin] registered tools', {
+      count: allTools.length,
+      control_tools: controlTools.map(t => t.name),
+      capability_tools: capabilityTools.map(t => t.name),
+      capability_schema_source: 'build-time snapshot (dist/capabilities.snapshot.json)',
+    });
   }
 
   // ---- service / route ----
