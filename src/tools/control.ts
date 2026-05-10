@@ -29,9 +29,71 @@ import { ensureOpenClawHooksConfigured, ensurePluginToolsAlsoAllowed, readGatewa
 import { buildErrorDetailFields } from '../utils/error-detail.js';
 import { PLUGIN_VERSION } from '../version.js';
 import fs from 'node:fs/promises';
+import fsSync from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 
 function defaultStateDir(config: Required<HiOpenClawPluginConfig>): string {
   return config.stateDir || resolveStateDir(config.profile);
+}
+
+// 找 OpenClaw workspace 路径——register API 不暴露，只能从已知约定推。
+// 优先级：env > openclaw.json 里 agents.defaults.workspace > 默认 ~/.openclaw/workspace。
+function resolveOpenClawWorkspaceDir(): string {
+  const envDir = (process.env.OPENCLAW_WORKSPACE_DIR || '').trim();
+  if (envDir) return envDir;
+  // try openclaw.json
+  try {
+    const cfg = JSON.parse(
+      fsSync.readFileSync(path.join(os.homedir(), '.openclaw', 'openclaw.json'), 'utf8'),
+    );
+    const wd = cfg?.agents?.defaults?.workspace;
+    if (typeof wd === 'string' && wd.trim()) return wd.trim();
+  } catch {
+    // file missing / parse error / ...：都没所谓，用约定默认
+  }
+  return path.join(os.homedir(), '.openclaw', 'workspace');
+}
+
+// OpenClaw 的"它叫什么名字"在 workspace/IDENTITY.md。SOUL.md 协议要求 LLM 每个 session
+// 都读 IDENTITY.md，绝大多数活跃 OpenClaw 都会填好 Name 字段。我们 install 时直接读这个
+// 文件来取真实的 agent 名字，避免所有人 display_name 都掉成同一个 'OpenClaw Hi Agent' 默认值。
+//
+// 文件长这样（模板 + 填好 = 都常见）：
+//   - **Name:** Sage
+//     _(pick something you like)_
+//
+// 用户填的 LLM 通常会把占位符 _(...)_ 留下或删掉，所以不能光看下一行。
+// 我们用 inline 正则抓 ** Name :** 后面那一段；如果抓到的是模板占位符 _(...)_、空字符串、
+// 或包含 "pick something" 这类提示词，就当成"还没填"返回 null。
+function readOpenClawIdentityName(workspaceDir: string): string | null {
+  try {
+    const file = path.join(workspaceDir, 'IDENTITY.md');
+    const content = fsSync.readFileSync(file, 'utf8');
+    // 抓 "**Name:** XXX"，inline 形式（同一行有内容），避免抓到下一行的占位说明。
+    const inline = content.match(/\*\*Name:\*\*[ \t]+([^\n_*][^\n]*)/);
+    if (inline) {
+      const raw = inline[1].trim();
+      // 模板占位 / 空 / 仍是提示词：当成没填
+      if (!raw) return null;
+      if (raw.startsWith('_(') || raw.startsWith('(')) return null;
+      if (/pick something|fill this/i.test(raw)) return null;
+      // 限制长度，防 LLM 误填进段落
+      return raw.slice(0, 80);
+    }
+    // 抓下一行的形式："**Name:**\nFoo"
+    const block = content.match(/\*\*Name:\*\*[^\n]*\n[ \t]*([^\n_*][^\n]*)/);
+    if (block) {
+      const raw = block[1].trim();
+      if (!raw) return null;
+      if (raw.startsWith('_(') || raw.startsWith('(')) return null;
+      if (/pick something|fill this/i.test(raw)) return null;
+      return raw.slice(0, 80);
+    }
+    return null;
+  } catch {
+    return null;
+  }
 }
 
 function asJsonResult(payload: Record<string, unknown>): PluginToolResult {
@@ -177,8 +239,16 @@ export function buildHiAgentInstallTool(config: Required<HiOpenClawPluginConfig>
             args.metadata && typeof args.metadata === 'object' && !Array.isArray(args.metadata)
               ? args.metadata
               : {};
+          // display_name 解析优先级：caller 显式传 > workspace/IDENTITY.md 里 OpenClaw 自己填的
+          // Name > 'OpenClaw Hi Agent' 兜底。SOUL.md 协议保证活跃 OpenClaw 在 install 之前就读
+          // 过 IDENTITY.md，所以从这里读到的"Name:"通常是用户/LLM 已经认可的名字，比 system
+          // username 更准确，也比 hardcode "OpenClaw Hi Agent" 更可识别。
+          const workspaceDir = resolveOpenClawWorkspaceDir();
+          const identityName = readOpenClawIdentityName(workspaceDir);
+          const resolvedDisplayName =
+            args.display_name?.trim() || identityName || 'OpenClaw Hi Agent';
           registerResp = await pub.gateway.register({
-            display_name: args.display_name?.trim() || 'OpenClaw Hi Agent',
+            display_name: resolvedDisplayName,
             agent_kind: args.agent_kind?.trim() || 'external',
             capabilities: [],
             metadata: {
@@ -186,6 +256,14 @@ export function buildHiAgentInstallTool(config: Required<HiOpenClawPluginConfig>
               host: 'openclaw',
               plugin: 'hi-openclaw-plugin',
               plugin_version: PLUGIN_VERSION,
+              // 把"display_name 是怎么解析出来的"如实记下来，admin/ops 排查"为什么这个 agent
+              // 还叫 OpenClaw Hi Agent / 跟 IDENTITY.md 不一致"时直接看 metadata 就明白了。
+              display_name_source: args.display_name?.trim()
+                ? 'caller'
+                : identityName
+                ? 'openclaw_identity_md'
+                : 'fallback_default',
+              ...(identityName ? { openclaw_identity_name: identityName } : {}),
             },
           });
           const identity: HiIdentityState = {
