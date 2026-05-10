@@ -147,6 +147,11 @@ export function buildHiAgentInstallTool(config: Required<HiOpenClawPluginConfig>
           description: 'Subscribe to all default event topics (agent.message.created, pairing.*, listing_matching_session.updated, meeting.*, hi.release.published). Default true.',
           default: true,
         },
+        metadata: {
+          type: 'object',
+          description: 'Optional caller-supplied metadata merged into agent metadata at first register. Common use: channel attribution `{"channel_code":"..."}` from an invite landing page. The plugin still reserves the keys host/plugin/plugin_version (always set to identify this plugin) — caller-supplied values for those keys will be ignored. MUST forward channel_code from the user prompt verbatim — do not drop it, do not modify the value.',
+          additionalProperties: true,
+        },
       },
     },
     async execute(_id, params): Promise<PluginToolResult> {
@@ -156,6 +161,7 @@ export function buildHiAgentInstallTool(config: Required<HiOpenClawPluginConfig>
         host_session_key?: string;
         replace_existing_state?: boolean;
         subscribe_default_topics?: boolean;
+        metadata?: Record<string, unknown>;
       };
       try {
         let state = await loadStateWithQuarantine(stateDir, config.profile, config.platformBaseUrl);
@@ -164,11 +170,23 @@ export function buildHiAgentInstallTool(config: Required<HiOpenClawPluginConfig>
         let registerResp: any = null;
         if (!state.identity || args.replace_existing_state) {
           const pub = await buildPublicClients(config.platformBaseUrl);
+          // 调用方 metadata（典型来源：邀请落地页生成的 prompt 里 channel_code）先铺底，
+          // 然后强制覆盖 host/plugin/plugin_version 三个保留字段——既允许渠道归因这种
+          // 自定义 key 透传，又不让恶意调用方伪造 host=openclaw 之类的标记。
+          const callerMetadata =
+            args.metadata && typeof args.metadata === 'object' && !Array.isArray(args.metadata)
+              ? args.metadata
+              : {};
           registerResp = await pub.gateway.register({
             display_name: args.display_name?.trim() || 'OpenClaw Hi Agent',
             agent_kind: args.agent_kind?.trim() || 'external',
             capabilities: [],
-            metadata: { host: 'openclaw', plugin: 'hi-openclaw-plugin', plugin_version: PLUGIN_VERSION },
+            metadata: {
+              ...callerMetadata,
+              host: 'openclaw',
+              plugin: 'hi-openclaw-plugin',
+              plugin_version: PLUGIN_VERSION,
+            },
           });
           const identity: HiIdentityState = {
             agent_id: registerResp.agent.agent_id,
