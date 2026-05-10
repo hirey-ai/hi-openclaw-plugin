@@ -1,6 +1,6 @@
 {
   "name": "hirey",
-  "version": "1.0.21-bundle.0",
+  "version": "1.0.21-bundle.1",
   "repository": {
     "type": "git",
     "url": "https://github.com/hirey-ai/hi-openclaw-plugin.git"
@@ -49,9 +49,6 @@
   },
   "publishConfig": {
     "access": "public"
-  },
-  "peerDependencies": {
-    "openclaw": ">=2026.5.2"
   },
   "dependencies": {
     "@hirey/hi-agent-contracts": "^0.1.16",

@@ -2,11 +2,9 @@
   "id": "hirey",
   "name": "Hirey AI",
   "description": "Hirey Hi for OpenClaw — register Hi's tools, agent-events claim service, and webhook ingress in-process. People-to-people matching for jobs, hiring, housing, friendship, dating, founders, investors, lawyers, and any other human-lead goal.",
-  "version": "0.1.0",
-  "kind": "service",
   "activation": {
     "onStartup": true,
-    "onCapabilities": ["tool", "service"],
+    "onCapabilities": ["tool", "hook"],
     "onCommands": []
   },
   "contracts": {
