@@ -182,7 +182,7 @@ export function buildHiAgentInstallTool(config: Required<HiOpenClawPluginConfig>
     name: 'hi_agent_install',
     label: 'Hi agent install',
     description:
-      'One-shot install entrypoint. Registers a fresh Hi agent (or reuses existing identity), activates installation, declares delivery capabilities, subscribes to default event topics, and persists identity for subsequent Hi tool calls. Idempotent — calling it after a healthy install just refreshes installation/subscription state.',
+      'AGENT-side registration step on the Hi platform. Registers a fresh Hi agent (or reuses existing identity), activates installation, declares delivery capabilities, subscribes to default event topics, and persists identity for subsequent Hi tool calls. Idempotent — calling it after a healthy install just refreshes installation/subscription state. NOTE: structurally different from `openclaw plugins install clawhub:hirey` (which is the CLI that lays the plugin tarball on disk and registers it with the gateway). The CLI install puts hi_* tools on the gateway; THIS tool gives this OpenClaw host an agent identity on the Hi platform so those tools actually work. After `openclaw plugins install` succeeds in turn 1, hi_agent_install is the second step that completes registration in turn 2 — see the `hi-register` skill bundled with this plugin for the full flow. Never report a fabricated agent_id; if you cannot see this tool in your run inventory, the install just completed and you must wait for the user\'s next message before registration is possible.',
     parameters: {
       type: 'object',
       additionalProperties: false,
