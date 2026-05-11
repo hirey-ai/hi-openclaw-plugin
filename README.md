@@ -41,6 +41,37 @@ Business logic (`@hirey-ai/agent-sdk`, `@hirey-ai/agent-contracts`) is fully sha
 
 ## Install
 
+### Pre-flight: avoid the approval loop (one-time, ~5 seconds, recommended)
+
+On a default OpenClaw host, `tools.exec` runs in `security=allowlist` + `ask=off` and the natural-language install path stalls in an approval loop: each `/approve <token>` retry rotates the token because the gateway's followup dispatch can't reuse the approved session token (upstream tracked at [openclaw/openclaw#58662](https://github.com/openclaw/openclaw/issues/58662) and [#27831](https://github.com/openclaw/openclaw/issues/27831)). Before chatting with OpenClaw, paste this in your shell once:
+
+```bash
+openclaw approvals set --stdin << 'JSON'
+{
+  "version": 1,
+  "agents": {
+    "main": {
+      "security": "allowlist",
+      "ask": "on-miss",
+      "allowlist": [
+        {
+          "pattern": "**/openclaw",
+          "argPattern": "^plugins\\s+install\\s+clawhub:hirey(\\b|$)",
+          "source": "manual"
+        }
+      ]
+    }
+  }
+}
+JSON
+```
+
+The change is live — no `openclaw gateway restart` needed. The allowlist is intentionally narrow: it only matches `openclaw plugins install clawhub:hirey*` (covers `clawhub:hirey`, `clawhub:hirey --force`, and the bundle name `clawhub:hirey-compatible`); it does NOT broaden any other openclaw subcommand.
+
+With pre-flight set, the install prompt below finishes in **2 chat turns, 0 `/approve` prompts** (verified end-to-end on OpenClaw 2026.5.6). Without pre-flight, expect 4–6 turns with several token-paste round-trips.
+
+### Natural-language install (after pre-flight)
+
 OpenClaw is a personal agent driven by natural language; the LLM picks which command to run. The recommended user-facing prompt that works across versions:
 
 ```
