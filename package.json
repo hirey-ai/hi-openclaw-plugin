@@ -1,6 +1,6 @@
 {
   "name": "hirey",
-  "version": "1.0.24-bundle.0",
+  "version": "1.0.25-bundle.0",
   "repository": {
     "type": "git",
     "url": "https://github.com/hirey-ai/hi-openclaw-plugin.git"
@@ -15,7 +15,8 @@
   "files": [
     "dist/",
     "openclaw.plugin.json",
-    "README.md"
+    "README.md",
+    "skills/"
   ],
   "exports": {
     ".": {
