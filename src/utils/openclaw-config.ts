@@ -207,3 +207,25 @@ export async function readGatewayPort(): Promise<number> {
   const { root } = await readOpenClawConfig();
   return resolveGatewayPort(root);
 }
+
+// 找用户在 OpenClaw 上最近活跃的非 hook session_key。
+// hook:* / bootstrap:* 是 OpenClaw 给 isolated agentTurn 自动开的旁路 session，用户在主
+// chat 看不到，必须 skip。返回 null 代表找不到任何用户可见 session（首次安装 / 文件缺失）。
+// OpenClaw 默认 agent id 是 main；多 agent 户可扩 plugin config，此处暂写死。
+import fsSync from 'node:fs';
+export function findRecentUserSessionKey(): string | null {
+  const sessionsFile = path.join(os.homedir(), '.openclaw', 'agents', 'main', 'sessions', 'sessions.json');
+  try {
+    const raw = fsSync.readFileSync(sessionsFile, 'utf8');
+    const parsed = JSON.parse(raw) as { sessions?: Array<{ key?: string; updatedAt?: number }> };
+    const sessions = parsed.sessions || [];
+    const filtered = sessions.filter((s) => {
+      const k = String(s.key || '');
+      return k.length > 0 && !k.includes(':hook:') && !k.includes(':bootstrap:');
+    });
+    filtered.sort((a, b) => (Number(b.updatedAt) || 0) - (Number(a.updatedAt) || 0));
+    return filtered[0]?.key || null;
+  } catch {
+    return null;
+  }
+}

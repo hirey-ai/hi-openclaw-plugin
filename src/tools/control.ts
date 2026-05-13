@@ -25,7 +25,7 @@ import {
   updateState,
   type HiIdentityState,
 } from '../state.js';
-import { ensureOpenClawHooksConfigured, ensurePluginToolsAlsoAllowed, readGatewayPort } from '../utils/openclaw-config.js';
+import { ensureOpenClawHooksConfigured, ensurePluginToolsAlsoAllowed, readGatewayPort, findRecentUserSessionKey } from '../utils/openclaw-config.js';
 import { buildErrorDetailFields } from '../utils/error-detail.js';
 import { PLUGIN_VERSION } from '../version.js';
 import fs from 'node:fs/promises';
@@ -309,9 +309,13 @@ export function buildHiAgentInstallTool(config: Required<HiOpenClawPluginConfig>
         // + claim_ack（声明 fallback 路径）。preferred=local_receiver 跟老 hi-agent-receiver
         // 的官方语义对齐，让平台业务层对我们的对待跟传统 receiver 完全一致。
         //
-        // 注意 platform schema 约束：route_missing_policy=use_explicit_default_route 必须搭配
-        // 实际的 default_reply_route 对象；没 host_session_key 时直接 omit 这两个字段，让平台走
-        // 默认 (route_missing_policy=use_last_active_session) 兜底。
+        // default_reply_route：LLM 显式传 host_session_key 时优先用；未传时 fallback 到
+        // findRecentUserSessionKey() 自动探测当前活跃用户 session，确保 push 不会因为 LLM
+        // 忘传 session key 而永远掉进 isolated hook 黑洞。探测失败（首次安装前 sessions 文件
+        // 还不存在）才 omit 这两个字段，让 daemon 侧的 no_route_info_fallback 路径兜底。
+        const resolvedSessionKey =
+          (args.host_session_key ? args.host_session_key.trim() : null)
+          || findRecentUserSessionKey();
         const deliveryCapsBody: Record<string, unknown> = {
           preferred: 'local_receiver',
           capabilities: [
@@ -320,11 +324,11 @@ export function buildHiAgentInstallTool(config: Required<HiOpenClawPluginConfig>
             { kind: 'claim_ack', status: 'active', config: {} },
           ],
         };
-        if (args.host_session_key) {
+        if (resolvedSessionKey) {
           deliveryCapsBody.route_missing_policy = 'use_explicit_default_route';
           deliveryCapsBody.default_reply_route = {
             installation_id: state.identity!.installation_id,
-            session_key: args.host_session_key,
+            session_key: resolvedSessionKey,
             delivery_context: { channel: 'last', to: null, account_id: null, thread_id: null },
           };
         }
@@ -492,6 +496,10 @@ export function buildHiAgentInstallTool(config: Required<HiOpenClawPluginConfig>
             push_path_hint: hooksConfigure
               ? `http://127.0.0.1:${hooksConfigure.gateway_port}${hooksConfigure.hooks_path}/agent`
               : null,
+            default_reply_route_bound: !!resolvedSessionKey,
+            default_reply_route_session_key_source: resolvedSessionKey
+              ? (args.host_session_key?.trim() ? 'caller' : 'auto_detected')
+              : 'not_bound',
           },
           welcome,
         });

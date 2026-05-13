@@ -30,66 +30,27 @@ import {
 } from '../clients.js';
 import { resolveStateDir, readState, updateState } from '../state.js';
 import { buildOpenClawHookPayloadWithRoute } from '../utils/openclaw-hooks-payload.js';
+import { ensureOpenClawHooksConfigured, readGatewayPort, findRecentUserSessionKey } from '../utils/openclaw-config.js';
 import { streamAgentEvents } from '@hirey/hi-agent-sdk';
-import fs from 'node:fs';
-import os from 'node:os';
-import path from 'node:path';
 
-// 找用户在 OpenClaw 上**最近活跃的非 hook session_key**。
-// 用于把 install_welcome_recommendation 这种 "owner 安装欢迎" 类一次性 push 直接落到用户
-// 当前正在用的 chat 里（不要走默认 hook:<uuid> 的 isolated session，否则用户在主对话窗
-// 看不到，等于装完一片空白 → 流失）。
+// 哪些 event topics + payload kind 需要被强制落到 user 当前可见的 chat。
 //
-// hook:* session 是 OpenClaw 给 isolated agentTurn 自动开的旁路 session，用户在主 chat
-// 看不到；所以这里显式 skip。
-//
-// 其它常规 push（agent.message.created / pairing.* / meeting.* 等）保留 OpenClaw 默认行为
-// （isolated hook session），不动 sessionKey，由 OpenClaw 决定怎么 surface 到 user channel。
-function findRecentUserSessionKey(): string | null {
-  // OpenClaw 默认 agent id 是 main；多 agent 户暂不覆盖，需要时再扩 plugin config 暴露。
-  const sessionsFile = path.join(os.homedir(), '.openclaw', 'agents', 'main', 'sessions', 'sessions.json');
-  try {
-    const raw = fs.readFileSync(sessionsFile, 'utf8');
-    const parsed = JSON.parse(raw) as { sessions?: Array<{ key?: string; updatedAt?: number }> };
-    const sessions = parsed.sessions || [];
-    const filtered = sessions.filter((s) => {
-      const k = String(s.key || '');
-      // skip hook:* + 空 + 我们之前已知的 install/health 元 session 命名
-      return k.length > 0 && !k.includes(':hook:') && !k.includes(':bootstrap:');
-    });
-    filtered.sort((a, b) => (Number(b.updatedAt) || 0) - (Number(a.updatedAt) || 0));
-    return filtered[0]?.key || null;
-  } catch {
-    return null;
-  }
-}
-
-// 哪些 event topics + payload kind 应该被强制落到 user 当前 chat。
-//
-// install_welcome_recommendation：用户安装完毕后的"第一印象"消息，必须立即看到才不会让
-// owner 觉得"装完没事干"流失。
-//
-// install_welcome_onboarding（2026-05 新增）：跟 recommendation 互补的"主动问 owner 在
-// 找什么样的人"引导消息。这条 push 是存量 agent 覆盖路径——install 同步路径只能让新装
-// 用户在 hi_agent_install 工具 result 里看到 welcome，存量 agent（在新版部署之前已经
-// 装好的）必须靠 platform 端 bootstrapOnboardingFanOutWorker 异步推这条 push 来补发。
-// 同样必须落到用户当前 chat（不要走 isolated hook:* session），否则 owner 在主对话窗
-// 看不到 onboarding 跟"装完没引导"心智上等价。
-//
-// category_match_notification（2026-05 新增）：平台主动撮合 lane 推给双方各一条
-// "Hi 帮你找到一个潜在朋友/合作对象/...，要不要 Hi 代你打个招呼"消息。push 内容里
-// 直接包含对方 listing 的 preview text + 平台 LLM 给出的 rationale + 给 LLM 的
-// instruction，owner 看到后能立刻决定要不要进入 contact_match。这是平台**主动**
-// 跟 owner 说话的场景，必须落到主对话窗（user 当前 chat）才让 owner 看到，否则
-// 跟"什么都没发生"心智等价，撮合 lane 就废了。
-//
-// 不同 kind 走 user-current-chat 的判定要扩展时**必须更新 reverse-dedup 文档**：use
-// SKILL 那边收到这两条 push 的处理 + dedup 规则要保持同步。
+// install_welcome_* / category_match_notification：平台主动向 owner 说话，必须立即可见。
+// 对于 reply_route_snapshot 里已带有 session_key / delivery_context 的常规事件（pairing.*
+// / meeting.* / agent.message.created），平台侧已经在创建 event 时解析好路由，这里不需要
+// 覆盖。只有当 event 既不属于"强制当前 chat"类型，也没有任何路由信息时（default_reply_route
+// 未绑定），才 fallback 到最近用户 session，避免事件永远掉进 isolated hook 黑洞。
 function shouldRouteToUserCurrentChat(event: any): boolean {
   const kind = event?.payload?.kind;
   return kind === 'install_welcome_recommendation'
     || kind === 'install_welcome_onboarding'
     || kind === 'category_match_notification';
+}
+
+function eventHasRouteInfo(event: any): boolean {
+  const rs = (event as any)?.reply_route_snapshot;
+  if (!rs) return false;
+  return !!(rs.session_key || rs.delivery_context?.channel || rs.delivery_context?.to);
 }
 
 // SSE 重连之间的最小等待，避免连接抖动时疯狂重连。线性 backoff 上限。
@@ -132,19 +93,26 @@ async function deliverEventToHooks(args: {
   event: any;
   logger: NonNullable<PluginServiceContext['logger']>;
 }): Promise<{ ok: boolean; status: number; body: string }> {
-  // 选择性 sessionKey override：只有 install_welcome_recommendation 这种"安装欢迎"
-  // 一次性事件，强制落到用户当前 chat（让用户立刻看到 Hi 推的人，避免装完空白流失）。
-  // 其他常规 push 不传 session_key，让 OpenClaw 默认 hook:<uuid> 路径处理。
+  // sessionKey 注入策略：
+  // 1. 强制当前 chat 的事件（install_welcome_* / category_match）→ 找最近用户 session
+  // 2. event 自带 reply_route_snapshot（platform 已解析路由）→ 不覆盖，让 payload builder 直接用
+  // 3. event 无任何路由信息（default_reply_route 未绑定 / install 时未传 host_session_key）
+  //    → fallback 到最近用户 session，避免 event 掉进 isolated hook 黑洞用户永远看不到
   let payloadConfig: { session_key?: string } | null = null;
-  if (shouldRouteToUserCurrentChat(args.event)) {
+  const needsSessionFallback = shouldRouteToUserCurrentChat(args.event) || !eventHasRouteInfo(args.event);
+  if (needsSessionFallback) {
     const sk = findRecentUserSessionKey();
     if (sk) {
       payloadConfig = { session_key: sk };
-      args.logger.info?.('[hi-openclaw-plugin] routing install-welcome push to user current chat', {
-        session_key: sk, kind: args.event?.payload?.kind,
+      args.logger.info?.('[hi-openclaw-plugin] routing push to user current session', {
+        session_key: sk,
+        topic: args.event?.topic,
+        kind: args.event?.payload?.kind,
+        reason: shouldRouteToUserCurrentChat(args.event) ? 'forced_current_chat' : 'no_route_info_fallback',
       });
     } else {
-      args.logger.warn?.('[hi-openclaw-plugin] install-welcome push: no recent non-hook session found, falling back to default hook routing', {
+      args.logger.warn?.('[hi-openclaw-plugin] push has no route info and no recent user session; falling back to isolated hook routing', {
+        topic: args.event?.topic,
         kind: args.event?.payload?.kind,
       });
     }
@@ -199,9 +167,41 @@ export function buildAgentEventsService(
       }> => {
         const state = await readState(stateDir, config.profile);
         if (!state.identity) return { auth: null, rt: null };
-        const inst = state.runtime?.install;
+        let inst = state.runtime?.install;
         if (!inst?.hooks_token || !inst?.hooks_path || !inst?.gateway_port) {
-          return { auth: null, rt: null };
+          // 自愈：identity 存在但 hooks 未配置时（hi_agent_install 在旧版本运行、或 state
+          // 被部分重置），直接从 openclaw.json 补全，不等 LLM 手动跑 hi_agent_install。
+          // 这解决"启动配置"类问题：插件 onStartup 启动后 daemon 能独立完成 hooks 绑定。
+          try {
+            const ensure = await ensureOpenClawHooksConfigured({ preferredToken: null });
+            const gatewayPort = await readGatewayPort();
+            const updated = await updateState(stateDir, config.profile, (cur) => ({
+              ...cur,
+              runtime: {
+                ...cur.runtime,
+                install: {
+                  ...cur.runtime.install,
+                  hooks_token: ensure.hooks_token,
+                  hooks_path: ensure.hooks_path,
+                  gateway_port: gatewayPort,
+                },
+              },
+            }));
+            inst = updated.runtime.install;
+            logger.info?.('[hi-openclaw-plugin] daemon self-healed hooks config', {
+              hooks_path: ensure.hooks_path,
+              gateway_port: gatewayPort,
+              changed: ensure.changed,
+            });
+          } catch (err: any) {
+            logger.warn?.('[hi-openclaw-plugin] hooks self-heal failed, will retry', {
+              error: String(err?.message || err),
+            });
+            return { auth: null, rt: null };
+          }
+          if (!inst?.hooks_token || !inst?.hooks_path || !inst?.gateway_port) {
+            return { auth: null, rt: null };
+          }
         }
         const auth = await buildAuthorizedClients({
           stateDir, profile: config.profile, platformBaseUrl: config.platformBaseUrl,
@@ -216,9 +216,9 @@ export function buildAgentEventsService(
         return {
           auth,
           rt: {
-            hooks_token: inst.hooks_token,
-            hooks_path: inst.hooks_path,
-            gateway_port: inst.gateway_port,
+            hooks_token: inst.hooks_token!,
+            hooks_path: inst.hooks_path!,
+            gateway_port: inst.gateway_port!,
           },
         };
       };
