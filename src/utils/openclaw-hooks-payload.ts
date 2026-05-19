@@ -15,18 +15,66 @@ function normalizeText(value: unknown): string {
   return typeof value === 'string' ? value.trim() : '';
 }
 
+// 2026-05：pairing.* event 里每条 need_ref 都带 platform 算好的
+// viewer_relation_role: "self" | "counterparty" | "unknown"（hi-platform
+// 在 sanitizePairingNeedRefsForSurface 按收件人 agent_id 派生）。早期 bot LLM
+// 容易把 relation_role(absolute) 当 viewer-relative 用，结果把自己 listing 的
+// owner profile 当成"对方"渲染（5/18 Walter "对方=我自己" bug 的直接成因）。
+// 这里在 message 顶部插一段 hint + 把 counterpart/self listing_id 提到顶层，
+// 让 bot LLM 不必再用 relation_role 推断。
+function buildPairingViewerHint(event: AgentGatewayEventSnapshot): {
+  hint: string;
+  helper: Record<string, unknown>;
+} | null {
+  const topic = String(event?.topic || '');
+  if (topic !== 'pairing.created' && topic !== 'pairing.updated') return null;
+  const payload = (event as any)?.payload;
+  const needRefs = Array.isArray(payload?.need_refs) ? payload.need_refs : [];
+  if (needRefs.length === 0) return null;
+  let counterpartListingId: string | null = null;
+  let selfListingId: string | null = null;
+  let counterpartAgentId: string | null = null;
+  let selfAgentId: string | null = null;
+  for (const ref of needRefs) {
+    const role = normalizeText(ref?.viewer_relation_role);
+    const listingId = normalizeText(ref?.listing_id);
+    const agentId = normalizeText(ref?.agent_id);
+    if (role === 'counterparty' && listingId) {
+      counterpartListingId = listingId;
+      counterpartAgentId = agentId || null;
+    } else if (role === 'self' && listingId) {
+      selfListingId = listingId;
+      selfAgentId = agentId || null;
+    }
+  }
+  if (!counterpartListingId && !selfListingId) return null;
+  // 一条祈使句给 LLM，明示绝不能把 self_listing_id 当成对方。
+  const hint = '[hi pairing hint] When you describe the other party, use ONLY the need_ref whose viewer_relation_role === "counterparty". Never read the self need_ref (viewer_relation_role === "self") as if it were the other side — it is YOUR own listing and rendering its owner profile as "对方/counterpart" is a known bug class.';
+  const helper: Record<string, unknown> = {
+    counterpart_listing_id: counterpartListingId,
+    self_listing_id: selfListingId,
+    counterpart_agent_id: counterpartAgentId,
+    self_agent_id: selfAgentId,
+  };
+  return { hint, helper };
+}
+
 function buildOpenClawContinuationMessage(
   event: AgentGatewayEventSnapshot,
   messagePrefix: string | null,
 ): string {
   const parts: string[] = [];
   if (messagePrefix) parts.push(messagePrefix);
+  const viewerHint = buildPairingViewerHint(event);
+  if (viewerHint) parts.push(viewerHint.hint);
   if ((event as any)?.preview?.text) parts.push(String((event as any).preview.text));
-  parts.push(JSON.stringify({
+  const jsonBody: Record<string, unknown> = {
     topic: event.topic,
     resource_ref: (event as any).resource_ref || {},
     payload: (event as any).payload || {},
-  }));
+  };
+  if (viewerHint) jsonBody.viewer_helper = viewerHint.helper;
+  parts.push(JSON.stringify(jsonBody));
   return parts.filter(Boolean).join('\n\n');
 }
 
