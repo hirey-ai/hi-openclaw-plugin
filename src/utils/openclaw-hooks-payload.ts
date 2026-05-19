@@ -15,13 +15,23 @@ function normalizeText(value: unknown): string {
   return typeof value === 'string' ? value.trim() : '';
 }
 
-// 2026-05：pairing.* event 里每条 need_ref 都带 platform 算好的
-// viewer_relation_role: "self" | "counterparty" | "unknown"（hi-platform
-// 在 sanitizePairingNeedRefsForSurface 按收件人 agent_id 派生）。早期 bot LLM
-// 容易把 relation_role(absolute) 当 viewer-relative 用，结果把自己 listing 的
-// owner profile 当成"对方"渲染（5/18 Walter "对方=我自己" bug 的直接成因）。
-// 这里在 message 顶部插一段 hint + 把 counterpart/self listing_id 提到顶层，
-// 让 bot LLM 不必再用 relation_role 推断。
+// 2026-05：pairing.* event hint。
+//
+// 平台在 enqueuePairingGatewayEvents 给每条 pairing event 注入三段渲染所需信息，
+// 每段按收件人 agent_id 各算一份：
+//   - payload.need_refs[].viewer_relation_role: "self"|"counterparty"|"unknown"
+//     listing-based pair 用：拿对面 listing 详情用 counterpart_listing_id
+//   - payload.viewer_side: "left"|"right"|"unknown"
+//     listing-less pair 用：bot 直接用 pairing.{left,right}_agent_id 判 self/other
+//   - payload.counterpart_snapshot: { agent, owner, company? }（per-recipient）
+//     首选渲染源：对面的 agent display_name + owner headline + company display
+//     name & summary。listing-less pair 没 listing 可读，必须吃这个；listing-based
+//     pair 也优先用它（更稳健，避免 hi-openclaw-plugin 5/18 Walter "对方=我自己" 那类
+//     bug —— 那次本质是 bot 从 self listing.text 抠 owner profile）。
+//   - payload.origin: { kind: 'listing_match'|'owner_contact'|'company_contact'|'agent_contact', id }
+//     pair 来源溯源，bot 可以告诉 user "Joe 从你的公司主页找到你" 之类。
+//
+// 这里把 helper 派生字段提到 message 顶层 + 加一条 hint 祈使句，让 LLM 不容易绕开。
 function buildPairingViewerHint(event: AgentGatewayEventSnapshot): {
   hint: string;
   helper: Record<string, unknown>;
@@ -29,32 +39,77 @@ function buildPairingViewerHint(event: AgentGatewayEventSnapshot): {
   const topic = String(event?.topic || '');
   if (topic !== 'pairing.created' && topic !== 'pairing.updated') return null;
   const payload = (event as any)?.payload;
-  const needRefs = Array.isArray(payload?.need_refs) ? payload.need_refs : [];
-  if (needRefs.length === 0) return null;
+  if (!payload) return null;
+
+  // ---- listing-based pair：从 need_refs 抓 counterpart/self listing ----
+  const needRefs = Array.isArray(payload.need_refs) ? payload.need_refs : [];
   let counterpartListingId: string | null = null;
   let selfListingId: string | null = null;
-  let counterpartAgentId: string | null = null;
-  let selfAgentId: string | null = null;
+  let counterpartAgentIdFromRefs: string | null = null;
+  let selfAgentIdFromRefs: string | null = null;
   for (const ref of needRefs) {
     const role = normalizeText(ref?.viewer_relation_role);
     const listingId = normalizeText(ref?.listing_id);
     const agentId = normalizeText(ref?.agent_id);
     if (role === 'counterparty' && listingId) {
       counterpartListingId = listingId;
-      counterpartAgentId = agentId || null;
+      counterpartAgentIdFromRefs = agentId || null;
     } else if (role === 'self' && listingId) {
       selfListingId = listingId;
-      selfAgentId = agentId || null;
+      selfAgentIdFromRefs = agentId || null;
     }
   }
-  if (!counterpartListingId && !selfListingId) return null;
-  // 一条祈使句给 LLM，明示绝不能把 self_listing_id 当成对方。
-  const hint = '[hi pairing hint] When you describe the other party, use ONLY the need_ref whose viewer_relation_role === "counterparty". Never read the self need_ref (viewer_relation_role === "self") as if it were the other side — it is YOUR own listing and rendering its owner profile as "对方/counterpart" is a known bug class.';
+
+  // ---- listing-less pair：从 viewer_side + pairing.{left,right}_agent_id 推 ----
+  const viewerSide = normalizeText(payload.viewer_side);
+  const pairingObj = (payload.pairing && typeof payload.pairing === 'object') ? payload.pairing : {};
+  const leftAgentId = normalizeText((pairingObj as any).left_agent_id);
+  const rightAgentId = normalizeText((pairingObj as any).right_agent_id);
+  let counterpartAgentIdFromSide: string | null = null;
+  let selfAgentIdFromSide: string | null = null;
+  if (viewerSide === 'left') {
+    selfAgentIdFromSide = leftAgentId || null;
+    counterpartAgentIdFromSide = rightAgentId || null;
+  } else if (viewerSide === 'right') {
+    selfAgentIdFromSide = rightAgentId || null;
+    counterpartAgentIdFromSide = leftAgentId || null;
+  }
+
+  // counterpart_snapshot（per-recipient）—— 首选渲染源
+  const snap = (payload.counterpart_snapshot && typeof payload.counterpart_snapshot === 'object')
+    ? payload.counterpart_snapshot as Record<string, any>
+    : null;
+
+  // origin —— bot 可以用来说"对方是从你 owner 主页/公司主页/listing match 找到你的"
+  const origin = (payload.origin && typeof payload.origin === 'object')
+    ? payload.origin as Record<string, any>
+    : null;
+
+  // 如果什么都没拿到，老 listing-based pair 老路径退化 —— 不发 hint 避免噪音。
+  const hasAnythingUseful = counterpartListingId || selfListingId
+    || snap || counterpartAgentIdFromSide || origin;
+  if (!hasAnythingUseful) return null;
+
+  // 一条祈使句给 LLM：优先 counterpart_snapshot；其次 viewer_side；最后 need_refs。
+  // 显式列举 origin.kind 怎么解释，让 bot 用 user-friendly 表述对方触达来源。
+  const hint = [
+    '[hi pairing hint] To render "对方/the other party" correctly, prefer this order:',
+    '  1. payload.counterpart_snapshot.{agent, owner, company} — already filtered to the other side; use owner.display_name + owner.headline + company.display_name + company.summary.',
+    '  2. payload.viewer_side ("left" | "right") + pairing.{left,right}_agent_id — for listing-less pairs (need_refs is empty).',
+    '  3. payload.need_refs[] whose viewer_relation_role === "counterparty" — for listing-based pairs.',
+    'NEVER read the "self" need_ref or the listing on YOUR side as if it were the other party — that is YOUR own listing.',
+    'payload.origin.kind tells you HOW they reached you: "listing_match" (matcher recommendation), "owner_contact" (clicked your owner card), "company_contact" (clicked your company page), "agent_contact" (direct).',
+  ].join('\n');
+
   const helper: Record<string, unknown> = {
     counterpart_listing_id: counterpartListingId,
     self_listing_id: selfListingId,
-    counterpart_agent_id: counterpartAgentId,
-    self_agent_id: selfAgentId,
+    counterpart_agent_id: counterpartAgentIdFromRefs || counterpartAgentIdFromSide,
+    self_agent_id: selfAgentIdFromRefs || selfAgentIdFromSide,
+    viewer_side: viewerSide || null,
+    origin_kind: origin?.kind ? String(origin.kind) : null,
+    origin_id: origin?.id ? String(origin.id) : null,
+    counterpart_snapshot: snap,
   };
   return { hint, helper };
 }
