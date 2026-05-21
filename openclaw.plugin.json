@@ -7,7 +7,7 @@
     "onCapabilities": ["tool", "hook"],
     "onCommands": []
   },
-  "skills": ["hi-register"],
+  "skills": ["./skills"],
   "contracts": {
     "tools": [
       "hi_agent_status",
