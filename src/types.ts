@@ -43,9 +43,31 @@ export type PluginToolDefinition = {
 // 工厂会在每次 LLM session materialize 时被调一次，可基于 ctx.agentId / ctx.sessionKey 决定是否启用。
 export type PluginToolFactory = (ctx: PluginToolContext) => PluginToolDefinition | null;
 
+// OpenClaw 在 per-LLM-run materialize tools 时调一次 factory，ctx 里带着当前 session 的可信
+// runtime 字段（sessionKey / agentId / deliveryContext 等）。同步源：
+// /Users/lawrence/Code/openclaw/src/plugins/types.ts:141 OpenClawPluginToolContext。
+//
+// 标记成 trusted runtime 是因为这些字段是 host 进程自己填的，不来自 LLM args，不可被 LLM 伪造。
+// hi-openclaw-plugin 用它们做两件事：
+//   - capability tool execute 时把 sessionKey 注入 _ctx.host_session_key + host_reply_route，
+//     让 Hi 平台的 extractHostReplyRoute() 能抓住"事件源会话"做 workflow route binding（避免
+//     push 回到错的 session 这类问题，参见 Cursor plan hi_openclaw会话绑定）
+//   - control tool（hi_agent_install 等）在用户没显式传 host_session_key 时 fallback 到 ctx
+//     的运行时值
 export type PluginToolContext = {
-  // OpenClaw 在 per-LLM-run materialize tools 时调一次 factory；ctx 里通常含 sessionKey、agent id 等。
-  // 我们大多数 hi tool 不依赖 ctx，所以这里保留 unknown 即可，未来需要再细化。
+  agentId?: string;
+  sessionKey?: string;
+  sessionId?: string;
+  messageChannel?: string;
+  agentAccountId?: string;
+  deliveryContext?: {
+    channel?: string;
+    to?: string;
+    accountId?: string;
+    threadId?: string;
+  };
+  senderIsOwner?: boolean;
+  // forward-compat：host 加新字段时不需要 plugin 同步改类型
   readonly [key: string]: unknown;
 };
 
@@ -92,8 +114,15 @@ export type PluginRegisterApi = {
   registerTool?(factory: PluginToolFactory, options?: { names?: string[]; optional?: boolean }): void;
   registerService?(service: PluginServiceDefinition): void;
   registerHttpRoute?(route: PluginHttpRouteDefinition): void;
-  // 未来要 hook event（agent_start / before_prompt_build 之类）再补：
-  // on?(event: string, handler: (event: unknown, ctx: unknown) => Promise<void> | void): void;
+  // OpenClaw 2026.4.21+ 的 lifecycle hook 注册器。同步源 /Users/lawrence/Code/openclaw/src/plugins/types.ts:2272
+  // 我们用 before_prompt_build 在用户 reply 的 LLM turn 之前把 pending Hi push 注入到
+  // system prompt 末尾（appendSystemContext），prompt cache 友好。
+  // 老 OpenClaw（<4.21）不暴露 on，feature-detect 之后退到不注入（行为不变差）。
+  on?<K extends string>(
+    hookName: K,
+    handler: (event: unknown, ctx: unknown) => Promise<unknown> | unknown,
+    opts?: { priority?: number },
+  ): void;
 };
 
 // 对应 openclaw.plugin.json 的 configSchema。

@@ -21,12 +21,15 @@
 
 import type {
   PluginRegisterApi,
-  PluginToolDefinition,
   HiOpenClawPluginConfig,
 } from './types.js';
 import { buildAllControlTools } from './tools/control.js';
-import { buildAllCapabilityTools, loadCapabilitySnapshot } from './tools/capabilities.js';
+import { buildCapabilityToolFactory, loadCapabilitySnapshot } from './tools/capabilities.js';
 import { buildAgentEventsService } from './services/agent-events.js';
+import { createBeforePromptBuildHook } from './services/prompt-injection-hook.js';
+import { gcPendingPushes } from './services/pending-pushes.js';
+import { setPushInjectionActive } from './services/push-injection-state.js';
+import { resolveStateDir } from './state.js';
 import { buildWebhookRoute } from './routes/webhook.js';
 import { ensurePluginToolsAlsoAllowed } from './utils/openclaw-config.js';
 
@@ -72,20 +75,71 @@ export default function registerHiOpenClawPlugin(api: PluginRegisterApi): void {
     // 不在这层 try/catch 把异常吞掉：snapshot 异常意味着 plugin tarball 自身坏了（snapshot
     // build 时已经验过形态），偷偷续命比报错更危险。
     const capabilitySpecs = loadCapabilitySnapshot();
-    const capabilityTools = buildAllCapabilityTools(config, capabilitySpecs);
     for (const tool of controlTools) {
       api.registerTool(() => tool, { names: [tool.name] });
     }
-    for (const tool of capabilityTools) {
-      api.registerTool(() => tool, { names: [tool.name] });
+    // capability tool 注册策略：把 spec 包成 per-session factory，每次 OpenClaw materialize
+    // tool 时调一次 buildCapabilityTool(spec, config, ctx) —— execute 闭包 capture 当前 LLM
+    // session 的 sessionKey + deliveryContext，capability 调用时注入 _ctx.host_session_key
+    // 让 Hi 平台 workflow route binding 抓住事件源会话。
+    //
+    // 跟 1.0.x 早期"register 时一次性 build 全量 tool"的差别：descriptor (name/desc/parameters)
+    // 完全等价（spec 来自 build-time snapshot），只是 execute 闭包从 module-level 单例改成
+    // per-session 实例。OpenClaw 5.2+ descriptor cache (PR #76079) 看的是 descriptor 字段，
+    // 它们没变；execute 是 host materialize 时拿到的 tool object 上的方法，自然带 per-session
+    // 的 ctx。无 schema 漂移风险。
+    for (const spec of capabilitySpecs) {
+      api.registerTool(buildCapabilityToolFactory(spec, config), { names: [spec.tool_name] });
     }
-    const allTools: PluginToolDefinition[] = [...controlTools, ...capabilityTools];
     logger.info?.('[hi-openclaw-plugin] registered tools', {
-      count: allTools.length,
+      count: controlTools.length + capabilitySpecs.length,
       control_tools: controlTools.map(t => t.name),
-      capability_tools: capabilityTools.map(t => t.name),
+      capability_tools: capabilitySpecs.map(s => s.tool_name),
       capability_schema_source: 'build-time snapshot (dist/capabilities.snapshot.json)',
+      host_session_capture: 'enabled (per-session factory injects _ctx.host_session_key)',
     });
+  }
+
+  // ---- before_prompt_build hook (push context injection) ----
+  // OpenClaw 的 /hooks/agent 在 isolated cron turn 跑 LLM，那一段 push 内容永远进不了
+  // 用户真实 channel session 的 LLM context（实测 /tmp/hi-push-fix-spike/RESULTS.md）。
+  // 我们在用户回复的 LLM turn 之前用 before_prompt_build hook 注入 pending push——
+  // 这是 OpenClaw 公开 plugin SDK API，trigger==='user' 时 fire（在 192.168.3.27 5.6
+  // 上 verified）。daemon 自己的 /hooks/agent isolated turn 走 trigger='cron'，hook
+  // handler 跳过。
+  //
+  // env HI_PUSH_INJECTION=off 一键禁用 hook 注册，回到 daemon 单独通过 /hooks/agent 投
+  // 递的老行为（pending push 仍然会写文件但永远不会被 LLM 读到，相当于 no-op）。
+  const injectionDisabled = (process.env.HI_PUSH_INJECTION || '').trim().toLowerCase() === 'off';
+  if (injectionDisabled) {
+    logger.info?.('[hi-openclaw-plugin] push context injection DISABLED by HI_PUSH_INJECTION=off');
+  } else if (typeof api.on === 'function') {
+    try {
+      const hookHandler = createBeforePromptBuildHook({ config, logger });
+      api.on('before_prompt_build', hookHandler);
+      setPushInjectionActive(true);
+      logger.info?.('[hi-openclaw-plugin] registered before_prompt_build hook for push context injection');
+    } catch (err: any) {
+      logger.warn?.('[hi-openclaw-plugin] before_prompt_build hook registration failed; falling back to legacy /hooks/agent delivery', {
+        error: String(err?.message || err),
+      });
+    }
+  } else {
+    logger.warn?.(
+      '[hi-openclaw-plugin] host does not expose api.on; push context injection disabled (legacy /hooks/agent delivery). Upgrade OpenClaw to >=2026.4.21 to enable injection.',
+    );
+  }
+
+  // 启动时 sweep 一次 pending-pushes 目录清掉已 delivered 24h+ 的 entry。同步 io，
+  // 在 register 这个进程上下文里跑一次足够（不持续后台 GC，文件量很小）。
+  try {
+    const stateDir = config.stateDir || resolveStateDir(config.profile);
+    const gcResult = gcPendingPushes({ stateDir });
+    if (gcResult.scanned > 0) {
+      logger.info?.('[hi-openclaw-plugin] pending-pushes startup gc', gcResult);
+    }
+  } catch (err: any) {
+    logger.warn?.('[hi-openclaw-plugin] pending-pushes startup gc failed', { error: String(err?.message || err) });
   }
 
   // ---- service / route ----

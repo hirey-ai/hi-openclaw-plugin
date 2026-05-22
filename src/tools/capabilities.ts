@@ -37,11 +37,60 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import url from 'node:url';
-import type { PluginToolDefinition, PluginToolResult, HiOpenClawPluginConfig } from '../types.js';
+import type { PluginToolDefinition, PluginToolResult, HiOpenClawPluginConfig, PluginToolContext } from '../types.js';
 import { buildAuthorizedClients } from '../clients.js';
 import { resolveStateDir } from '../state.js';
 import { buildErrorDetailFields } from '../utils/error-detail.js';
 import type { PublicAgentCapability } from '@hirey/hi-agent-sdk';
+
+// 从 OpenClaw runtime ctx 抽出可信的 host_session_key + delivery_context，注入到 capability
+// 调用参数的 _ctx 字段里。Hi 平台 src/services/agentReplyRoutes.ts:142 extractHostReplyRoute
+// 读取这些字段把当前 session 当成"事件源会话"持久化进 agent_workflow_routes 表，后续异步
+// event 出箱时按 thread_action -> pairing -> listing -> install_default 优先级回放到这条
+// session。不注入的话平台只能 fallback 到"最近会话"启发式（findRecentUserSessionKey），
+// 在多 channel/多 session 用户上会把 push 注到错的 session。
+//
+// 信任策略：runtime ctx 的值是 host 进程自己填的，不可被 LLM args 覆写。execute(params, ...)
+// 收到的 params 即使带了 _ctx，也用 runtime ctx 的值覆盖 host_session_key / host_reply_route
+// 这两个权威字段。LLM 仍可用 params._ctx 传其它非路由字段（保持 forward-compat）。
+// Exported for unit testing. Not part of the public plugin API surface.
+export function enrichParamsWithHostContext(
+  params: unknown,
+  ctx: PluginToolContext,
+): Record<string, unknown> {
+  const base = (params && typeof params === 'object' && !Array.isArray(params))
+    ? { ...(params as Record<string, unknown>) }
+    : {};
+  const sessionKey = typeof ctx.sessionKey === 'string' ? ctx.sessionKey.trim() : '';
+  const dc = (ctx.deliveryContext && typeof ctx.deliveryContext === 'object')
+    ? ctx.deliveryContext
+    : undefined;
+  const channel = typeof dc?.channel === 'string' && dc.channel.trim() ? dc.channel.trim() : undefined;
+  const to = typeof dc?.to === 'string' && dc.to.trim() ? dc.to.trim() : undefined;
+  const accountId = typeof dc?.accountId === 'string' && dc.accountId.trim() ? dc.accountId.trim() : undefined;
+  const threadId = typeof dc?.threadId === 'string' && dc.threadId.trim() ? dc.threadId.trim() : undefined;
+  if (!sessionKey && !channel && !to && !accountId && !threadId) {
+    return base;
+  }
+  const existingCtx = (base._ctx && typeof base._ctx === 'object' && !Array.isArray(base._ctx))
+    ? { ...(base._ctx as Record<string, unknown>) }
+    : {};
+  const hostReplyRoute: Record<string, unknown> = {};
+  if (sessionKey) hostReplyRoute.session_key = sessionKey;
+  if (channel || to || accountId || threadId) {
+    const deliveryContext: Record<string, unknown> = {};
+    if (channel) deliveryContext.channel = channel;
+    if (to) deliveryContext.to = to;
+    if (accountId) deliveryContext.account_id = accountId;
+    if (threadId) deliveryContext.thread_id = threadId;
+    hostReplyRoute.delivery_context = deliveryContext;
+  }
+  // 覆盖 LLM 提供的同名字段：路由真相只能来自 runtime。其它 _ctx 字段保留以便 forward-compat。
+  if (sessionKey) existingCtx.host_session_key = sessionKey;
+  if (Object.keys(hostReplyRoute).length > 0) existingCtx.host_reply_route = hostReplyRoute;
+  base._ctx = existingCtx;
+  return base;
+}
 
 function defaultStateDir(config: Required<HiOpenClawPluginConfig>): string {
   return config.stateDir || resolveStateDir(config.profile);
@@ -63,12 +112,18 @@ function asErrorResult(error: string, details?: Record<string, unknown>): Plugin
 function buildCapabilityTool(
   spec: PublicAgentCapability,
   config: Required<HiOpenClawPluginConfig>,
+  ctx: PluginToolContext,
 ): PluginToolDefinition {
   const stateDir = defaultStateDir(config);
   // spec.parameters 原样作为 OpenClaw tool parameters：平台 schema 就是 single source of truth，
   // plugin 这边不做任何 properties / required 加工。schema 形态在 build-time（snapshot 写出
   // 时）和 runtime（loadCapabilitySnapshot）都校验过 parameters 必须是 plain object，到这里
   // 一定可用，不需要任何 fallback。
+  //
+  // ctx 由 OpenClaw 在每次 LLM session materialize tool 时传进来，含当前 sessionKey /
+  // deliveryContext 等可信运行时字段。execute 闭包 capture 一份，调 capability 时通过
+  // enrichParamsWithHostContext 注入到 _ctx.host_session_key + host_reply_route，让 Hi
+  // 平台的 workflow route binding 拿到事件源会话。详见 enrichParamsWithHostContext 注释。
   return {
     name: spec.tool_name,
     label: spec.title || `Hi ${spec.tool_name}`,
@@ -79,9 +134,10 @@ function buildCapabilityTool(
         const auth = await buildAuthorizedClients({
           stateDir, profile: config.profile, platformBaseUrl: config.platformBaseUrl,
         });
+        const enrichedParams = enrichParamsWithHostContext(params, ctx);
         const result = await auth.platform.callCapability(
           spec.capability_id,
-          (params || {}) as Record<string, unknown>,
+          enrichedParams,
         );
         return asJsonResult({ ok: true, ...(result as Record<string, unknown>), capability_id: spec.capability_id });
       } catch (err: any) {
@@ -176,11 +232,30 @@ export function loadCapabilitySnapshot(): PublicAgentCapability[] {
 
 // 用一组 PublicAgentCapability 实例化对应的 OpenClaw plugin tools。
 // 每个 capability 一个 tool；tool 的 parameters = capability.parameters（原样）。
+//
+// ctx：OpenClaw 每次 LLM session materialize tools 时传进来的可信运行时上下文。同一个 spec
+// 在不同 session 里 build 出来的 PluginToolDefinition 之间 descriptor（name/desc/parameters）
+// 完全一致（来自 build-time snapshot），execute 闭包 capture 各自 session 的 sessionKey /
+// deliveryContext。注：OpenClaw 5.2+ 在 register 阶段会 cache descriptor，但 execute 仍按
+// 每次 session materialize 时返回的 tool object 绑定，所以闭包 capture 的 ctx 不会跨 session 串。
 export function buildAllCapabilityTools(
   config: Required<HiOpenClawPluginConfig>,
   specs: readonly PublicAgentCapability[],
+  ctx: PluginToolContext = {},
 ): PluginToolDefinition[] {
-  return specs.map((spec) => buildCapabilityTool(spec, config));
+  return specs.map((spec) => buildCapabilityTool(spec, config, ctx));
+}
+
+// 把一个 capability spec 暴露给 host 的 registerTool factory：每次 host materialize 时
+// 用传进来的 ctx 重新 build tool（execute 闭包 capture per-session 的 sessionKey）。
+//
+// 这里没有缓存 —— 跟 register 阶段一次性 build 全量不同，host materialize 时 spec 仍是
+// 同一个常量引用，descriptor 仍来自 build-time snapshot，构造代价可忽略。
+export function buildCapabilityToolFactory(
+  spec: PublicAgentCapability,
+  config: Required<HiOpenClawPluginConfig>,
+): (ctx: PluginToolContext) => PluginToolDefinition {
+  return (ctx) => buildCapabilityTool(spec, config, ctx);
 }
 
 export function getCapabilityToolNames(specs: readonly PublicAgentCapability[]): string[] {

@@ -32,6 +32,8 @@ import { resolveStateDir, readState, updateState } from '../state.js';
 import { buildOpenClawHookPayloadWithRoute } from '../utils/openclaw-hooks-payload.js';
 import { ensureOpenClawHooksConfigured, readGatewayPort, findRecentUserSessionKey } from '../utils/openclaw-config.js';
 import { streamAgentEvents } from '@hirey/hi-agent-sdk';
+import { appendPendingPush } from './pending-pushes.js';
+import { isPushInjectionActive } from './push-injection-state.js';
 
 // 哪些 event topics + payload kind 需要被强制落到 user 当前可见的 chat。
 //
@@ -87,13 +89,25 @@ function resolveHooksUrl(rt: DaemonRuntimeConfig): string {
   return `http://127.0.0.1:${rt.gateway_port}${cleanedPath}/agent`;
 }
 
+// Exported for e2e harness use only. Not a stable plugin API surface.
+export async function __testing_deliverEventToHooks(args: {
+  hooksUrl: string;
+  hooksToken: string;
+  event: any;
+  stateDir: string;
+  logger: NonNullable<PluginServiceContext['logger']>;
+}): Promise<{ ok: boolean; status: number; body: string }> {
+  return deliverEventToHooks(args);
+}
+
 async function deliverEventToHooks(args: {
   hooksUrl: string;
   hooksToken: string;
   event: any;
+  stateDir: string;
   logger: NonNullable<PluginServiceContext['logger']>;
 }): Promise<{ ok: boolean; status: number; body: string }> {
-  // sessionKey 注入策略：
+  // sessionKey 决定策略：
   // 1. 强制当前 chat 的事件（install_welcome_* / category_match）→ 找最近用户 session
   // 2. event 自带 reply_route_snapshot（platform 已解析路由）→ 不覆盖，让 payload builder 直接用
   // 3. event 无任何路由信息（default_reply_route 未绑定 / install 时未传 host_session_key）
@@ -122,6 +136,85 @@ async function deliverEventToHooks(args: {
   // hook handler 卡死把 daemon 串行投递循环拖死。abort 会让 fetch throw AbortError，外层
   // deliverAndAck 的 catch 走 ack failed 路径（retry_after_ms=60_000），平台之后重投。
   const body = buildOpenClawHookPayloadWithRoute({ event: args.event, config: payloadConfig });
+
+  // ---- push 上下文双轨投递 ----
+  // 当 before_prompt_build hook 已注册成功（isPushInjectionActive=true）：
+  //   - 把 push 内容写到 pending-pushes 文件 keyed by 目标 sessionKey。用户下次回复
+  //     落到该 session 时 prompt-injection-hook 读出来注入到 system prompt 末尾，LLM 看到。
+  //   - 把 sessionKey 从 /hooks/agent payload 里 STRIP 掉，让 OpenClaw 自动用
+  //     hook:<uuid> isolated session。原因：/hooks/agent 强制 sessionTarget="isolated"
+  //     + forceNew=true，对传入的 sessionKey 会 rotate 其 sessionFile 指针，把用户的
+  //     真实 transcript 历史挂掉（实测 /tmp/hi-push-fix-spike/RESULTS.md）。strip 掉
+  //     之后 rotation 发生在 throwaway hook session 里，不影响用户主 session。
+  //   - channel/to/agentId 等字段保留：OpenClaw 在 isolated session 里跑 LLM、用这些
+  //     字段直接 channel-send 给用户（Walter 在 Telegram 看到 push 这一步 UX 不变）。
+  //
+  // 当 hook 未激活（老 OpenClaw / HI_PUSH_INJECTION=off）：
+  //   - 完全保留 1.0.30 旧行为：携带 sessionKey 投递。这条路径有 rotation bug 但
+  //     至少跟 prod 当前行为一致，不会比 1.0.30 更差（回滚到现状）。
+  if (isPushInjectionActive()) {
+    // pending-pushes 目标 sessionKey 的解析比 /hooks/agent payload 的 sessionKey 更激进：
+    //   - 优先 body.sessionKey（来自 reply_route_snapshot.session_key 或上面的 payloadConfig fallback）
+    //   - 若仍空，独立调用一次 findRecentUserSessionKey 兜底——覆盖 Walter 这类老 listing
+    //     场景：event 带 delivery_context 但 session_key 字段为空（platform 还没把这条
+    //     workflow 的 route 绑好），eventHasRouteInfo 已经返回 true 所以 needsSessionFallback
+    //     不触发，body.sessionKey 因此是 null。如果不补这次 findRecentUserSessionKey，
+    //     pending-pushes 找不到目标会话 → 用户回复时 LLM 仍然看不到 push（bug 没修）。
+    //   - 这一步只用于 pending-pushes 写入键；不会改 body.sessionKey，因为我们紧接着就
+    //     要 STRIP 它，免得 /hooks/agent rotate 用户 session。
+    let pushTargetSessionKey = (body.sessionKey || '').trim();
+    if (!pushTargetSessionKey) {
+      const fallback = findRecentUserSessionKey();
+      if (fallback) {
+        pushTargetSessionKey = fallback;
+        args.logger.info?.('[hi-openclaw-plugin] resolved pending-push target via findRecentUserSessionKey fallback', {
+          session_key: fallback,
+          event_id: args.event?.event_id,
+          reason: 'body.sessionKey empty (event had delivery_context but no explicit session_key)',
+        });
+      }
+    }
+
+    if (pushTargetSessionKey) {
+      try {
+        const renderedText = body.message;  // hook payload 的 message 字段就是 LLM 看到的全文
+        const writeResult = appendPendingPush({
+          stateDir: args.stateDir,
+          sessionKey: pushTargetSessionKey,
+          entry: {
+            event_id: String(args.event?.event_id || `t${Date.now()}-${Math.random().toString(36).slice(2, 8)}`),
+            topic: typeof args.event?.topic === 'string' ? args.event.topic : undefined,
+            queued_at: Date.now(),
+            rendered_text: renderedText,
+          },
+        });
+        args.logger.info?.('[hi-openclaw-plugin] queued push for user session injection', {
+          session_key: pushTargetSessionKey,
+          event_id: args.event?.event_id,
+          topic: args.event?.topic,
+          wrote: writeResult.wrote,
+          ...(writeResult.reason ? { skip_reason: writeResult.reason } : {}),
+        });
+      } catch (err: any) {
+        // pending-pushes 写失败不阻止投递；用户至少能在 channel 看到 push（透过下面
+        // /hooks/agent 的 channel-send），只是这次的 LLM context injection 会缺。
+        args.logger.warn?.('[hi-openclaw-plugin] pending-pushes append failed; channel-send will still happen', {
+          error: String(err?.message || err),
+          session_key: pushTargetSessionKey,
+        });
+      }
+    } else {
+      args.logger.warn?.('[hi-openclaw-plugin] push has no target sessionKey and no recent user session; LLM context injection will be missing', {
+        topic: args.event?.topic,
+        kind: args.event?.payload?.kind,
+      });
+    }
+    // STRIP sessionKey 防 /hooks/agent rotate 用户 session
+    if (body.sessionKey) {
+      delete (body as any).sessionKey;
+    }
+  }
+
   const response = await fetch(args.hooksUrl, {
     method: 'POST',
     headers: {
@@ -235,7 +328,7 @@ export function buildAgentEventsService(
         let result: any = null;
         try {
           const r = await deliverEventToHooks({
-            hooksUrl, hooksToken: rt.hooks_token, event, logger,
+            hooksUrl, hooksToken: rt.hooks_token, event, stateDir, logger,
           });
           result = r;
         } catch (err: any) {
