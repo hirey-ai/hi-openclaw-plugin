@@ -217,14 +217,30 @@ export function findRecentUserSessionKey(): string | null {
   const sessionsFile = path.join(os.homedir(), '.openclaw', 'agents', 'main', 'sessions', 'sessions.json');
   try {
     const raw = fsSync.readFileSync(sessionsFile, 'utf8');
-    const parsed = JSON.parse(raw) as { sessions?: Array<{ key?: string; updatedAt?: number }> };
-    const sessions = parsed.sessions || [];
-    const filtered = sessions.filter((s) => {
-      const k = String(s.key || '');
-      return k.length > 0 && !k.includes(':hook:') && !k.includes(':bootstrap:');
-    });
-    filtered.sort((a, b) => (Number(b.updatedAt) || 0) - (Number(a.updatedAt) || 0));
-    return filtered[0]?.key || null;
+    const parsed = JSON.parse(raw) as unknown;
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return null;
+    // OpenClaw sessions.json schema: {<sessionKey>: SessionEntry}, NOT {sessions: [{key, ...}]}.
+    // 此前 1.0.0~1.0.32 这里把它解成 `{sessions: [...]}` 数组形式——OpenClaw 早期改 schema 之后
+    // 就一直返回 null（broken 多版本）。把 push 投递的 fallback 路径吃了——event 缺
+    // explicit reply_route_snapshot.session_key 时永远走不到"最近用户 session"，直接进 hook:<uuid>
+    // 黑洞，用户在 channel 看到 push、回复时 LLM 不知道。1.0.33 修了，配合 1.0.32 的
+    // before_prompt_build 注入闭环。
+    const entries = Object.entries(parsed as Record<string, unknown>)
+      .filter(([key]) => {
+        if (typeof key !== 'string' || key.length === 0) return false;
+        // hook:/bootstrap:/cron: prefix 是 OpenClaw 自动开的旁路 session，没有 user transcript
+        if (key.startsWith('hook:') || key.startsWith('bootstrap:') || key.startsWith('cron:')) return false;
+        // agent:<id>:hook:<uuid> / agent:<id>:bootstrap:<uuid> 嵌套形态也排除
+        if (key.includes(':hook:') || key.includes(':bootstrap:')) return false;
+        return true;
+      })
+      .map(([key, value]) => {
+        const entry = (value && typeof value === 'object') ? value as Record<string, unknown> : {};
+        const updatedAt = Number((entry as any).updatedAt) || 0;
+        return { key, updatedAt };
+      })
+      .sort((a, b) => b.updatedAt - a.updatedAt);
+    return entries[0]?.key || null;
   } catch {
     return null;
   }
