@@ -29,6 +29,7 @@ import { buildAgentEventsService } from './services/agent-events.js';
 import { createBeforePromptBuildHook } from './services/prompt-injection-hook.js';
 import { gcPendingPushes } from './services/pending-pushes.js';
 import { setPushInjectionActive } from './services/push-injection-state.js';
+import { reconcileInstallationOnBoot } from './services/installation-reconcile.js';
 import { resolveStateDir } from './state.js';
 import { buildWebhookRoute } from './routes/webhook.js';
 import { ensurePluginToolsAlsoAllowed } from './utils/openclaw-config.js';
@@ -185,6 +186,15 @@ export default function registerHiOpenClawPlugin(api: PluginRegisterApi): void {
         error: String(err?.message || err),
       });
     });
+
+  // 启动时跑一次 reconcile：state.identity 已存在但 plugin_version_synced 跟当前 PLUGIN_VERSION
+  // 不一致时（比如老用户从 1.0.33 升到 1.0.37），主动把新版本 metadata + 当前 delivery_capabilities
+  // 推一次给平台。fire-and-forget，所有错误 fail-soft。详见 installation-reconcile.ts 文件头。
+  void reconcileInstallationOnBoot(config, logger).catch((err: any) => {
+    logger.warn?.('[hi-openclaw-plugin] installation reconcile threw unexpectedly (should be fail-soft inside)', {
+      error: String(err?.message || err),
+    });
+  });
 
   logger.info?.(
     '[hi-openclaw-plugin] register complete',

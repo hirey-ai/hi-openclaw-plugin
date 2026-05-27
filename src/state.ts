@@ -20,6 +20,11 @@ export type HiIdentityState = {
   jwks_url: string;
   activated_at: string | null;
   delivery_capabilities: Record<string, unknown> | null;
+  // 上一次成功把本机 plugin metadata + delivery_capabilities 同步到平台时使用的 plugin 版本。
+  // 启动 reconcile 用这个跟当前 PLUGIN_VERSION 比对：不同就推一次 updateInstallation 把新版本
+  // metadata + 新 capability 声明送上去，避免出现"本地升级了但平台 installation 记录还按老
+  // 版本路由"的孤儿状态。null = 老 state 文件、reconcile 视作首次升级。
+  plugin_version_synced: string | null;
 };
 
 export type HiPlatformState = {
@@ -95,7 +100,14 @@ export async function readState(stateDir: string, profile: string): Promise<HiPe
     return {
       profile: typeof parsed.profile === 'string' && parsed.profile.trim() ? parsed.profile : profile,
       platform: parsed.platform ?? null,
-      identity: parsed.identity ?? null,
+      identity: parsed.identity
+        ? {
+            ...parsed.identity,
+            // 老 state 文件没有这个字段；视作 unknown，让 reconcile 跑一次把它写上。
+            plugin_version_synced:
+              (parsed.identity as Partial<HiIdentityState>).plugin_version_synced ?? null,
+          }
+        : null,
       runtime: {
         last_consumed_stream_seq: Number(parsed.runtime?.last_consumed_stream_seq || 0),
         last_claim_lease_id: parsed.runtime?.last_claim_lease_id ?? null,

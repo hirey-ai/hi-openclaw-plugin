@@ -280,6 +280,7 @@ export function buildHiAgentInstallTool(config: Required<HiOpenClawPluginConfig>
             jwks_url: registerResp.auth.jwks_url,
             activated_at: null,
             delivery_capabilities: null,
+            plugin_version_synced: null,
           };
           state = await updateState(stateDir, config.profile, (cur) => ({
             ...cur,
@@ -335,7 +336,15 @@ export function buildHiAgentInstallTool(config: Required<HiOpenClawPluginConfig>
         let installationUpdate: any = null;
         let installationUpdateError: { message: string; response_body?: unknown } | null = null;
         try {
+          // 一起把 plugin metadata 推上去——平台 installation.metadata_json 是 admin/ops 排查
+          // "用户跑的什么版本"的唯一可信来源；不带 metadata 的 update 会让 install 记录永远停在
+          // 首次 register 那个版本，老用户升级后平台看不到任何版本号变化。
           installationUpdate = await auth.gateway.updateInstallation({
+            metadata: {
+              host: 'openclaw',
+              plugin: 'hi-openclaw-plugin',
+              plugin_version: PLUGIN_VERSION,
+            },
             delivery_capabilities: deliveryCapsBody,
           } as any);
         } catch (err: any) {
@@ -345,6 +354,16 @@ export function buildHiAgentInstallTool(config: Required<HiOpenClawPluginConfig>
             message: String(err?.message || err),
             response_body: err?.response_body ?? err?.responseBody ?? err?.body ?? null,
           };
+        }
+        // updateInstallation 成功才把 plugin_version_synced 推进——失败保持原样，下次启动 reconcile
+        // 还会再试一次。
+        if (!installationUpdateError) {
+          state = await updateState(stateDir, config.profile, (cur) => ({
+            ...cur,
+            identity: cur.identity
+              ? { ...cur.identity, plugin_version_synced: PLUGIN_VERSION }
+              : cur.identity,
+          }));
         }
 
         // Step 4.5: 保证 OpenClaw 主 config 的 hooks 段被启用 + 写入一致的 hooks_token，
