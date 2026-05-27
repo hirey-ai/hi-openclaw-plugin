@@ -4,32 +4,42 @@
   "description": "Hirey Hi for OpenClaw — register Hi's tools, agent-events claim service, and webhook ingress in-process. People-to-people matching for jobs, hiring, housing, friendship, dating, founders, investors, lawyers, and any other human-lead goal.",
   "activation": {
     "onStartup": true,
-    "onCapabilities": ["tool", "hook"],
+    "onCapabilities": [
+      "tool",
+      "hook"
+    ],
     "onCommands": []
   },
-  "skills": ["./skills"],
+  "skills": [
+    "./skills"
+  ],
   "contracts": {
     "tools": [
       "hi_agent_status",
-      "hi_agent_doctor",
       "hi_agent_install",
+      "hi_agent_doctor",
       "hi_agent_reset",
       "hi_agent_recover",
       "hi_pull_events",
-      "agent_listings",
-      "matching_sessions",
-      "pairings",
-      "thread_meetings",
-      "conversations",
-      "listing_taxonomy",
       "agent_credits",
+      "agent_listings",
       "content_get",
       "content_render",
+      "conversations",
+      "event_groups",
       "faq_get",
       "faq_search",
+      "listing_taxonomy",
+      "matching_sessions",
+      "owner_intro_videos",
+      "owners",
+      "pairings",
+      "phone_binding",
       "social_org",
       "social_permissions",
-      "social_relationships"
+      "social_relationships",
+      "staff_admin",
+      "thread_meetings"
     ]
   },
   "configSchema": {

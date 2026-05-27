@@ -19,6 +19,19 @@
 // - 任何一项缺 capability_id / tool_name / parameters → process.exit(1)
 // 这跟"不要兜底"、"清技术债不要保留隐藏兼容" 一致：snapshot 拉不到，整个发布就该失败，
 // 不允许偷偷塞 hardcoded fallback schema 又让线上用户去发现 schema 漂移。
+//
+// 2026-05-28 新加：脚本同时重写 openclaw.plugin.json 的 contracts.tools，让 manifest 跟
+// snapshot 始终对齐（唯一 source of truth = prod /v1/capabilities + 本文件 STATIC_LOCAL_TOOLS）。
+// 之前 manifest 是手维护数组，加新 platform capability 时人脑里链路是「写 platform tools.ts
+// → snapshot 自动包含 → publish」，无人记得 plugin manifest 还有平行存在的数组，结果
+// 1.0.34~1.0.37 漏掉 owners/phone_binding/event_groups/owner_intro_videos/staff_admin 共
+// 5 个工具：OpenClaw 的 tools.alsoAllow=group:plugins 过滤层认 contracts.tools，没声明的
+// 被 host 静默 drop，LLM toolbox 里看不见 → 用户用不了 update_profile。
+// 改成脚本生成消灭这条 manual sync 路径。
+//
+// `--check` 模式：CI 里跑 `node scripts/snapshot-capabilities.mjs --check`，只验证当前
+// 磁盘上的 snapshot + manifest 跟 prod 真相是否一致，**不**写任何文件。漂移就 exit 1。
+// 适合 PR check / release-audit 兜底；本地 prepack 仍走默认 write 模式。
 
 import fs from 'node:fs';
 import path from 'node:path';
@@ -28,6 +41,24 @@ const __dirname = path.dirname(url.fileURLToPath(import.meta.url));
 const REPO_ROOT = path.resolve(__dirname, '..');
 const DIST_DIR = path.join(REPO_ROOT, 'dist');
 const SNAPSHOT_PATH = path.join(DIST_DIR, 'capabilities.snapshot.json');
+const MANIFEST_PATH = path.join(REPO_ROOT, 'openclaw.plugin.json');
+
+// 本地 control tools（src/tools/control.ts 的 buildAllControlTools）。这 6 个是 plugin
+// 进程内注册的工具，不来自 platform capability snapshot，所以脚本无法从 snapshot 推断，
+// 必须显式列出。新增本地 control tool 时同步改这里；漏改的话 manifest 里 contracts.tools
+// 会缺它，OpenClaw 的 group:plugins 过滤层就会把它从 LLM toolbox 滤掉（跟之前
+// owners 漂移完全同种 bug）。这就是 source-of-truth 单点的 trade-off：少一个 source
+// of truth，多一个必须保持手动同步的常量；但只有 6 项、改动频率每月 < 1 次，可接受。
+const STATIC_LOCAL_TOOLS = [
+  'hi_agent_status',
+  'hi_agent_install',
+  'hi_agent_doctor',
+  'hi_agent_reset',
+  'hi_agent_recover',
+  'hi_pull_events',
+];
+
+const CHECK_ONLY = process.argv.includes('--check');
 
 // 跟 src/index.ts defaultedConfig 里 platformBaseUrl 的默认值保持一致（'https://hi.hirey.ai'）。
 // 两处都是 hardcoded prod URL（runtime 跟 build 各一份），改 prod 域名时这两处必须同步改。
@@ -85,14 +116,69 @@ async function main() {
   // dump 成纯数组，不加 metadata wrapper：snapshot 形态就是 PublicAgentCapability[]，
   // 运行时 loadCapabilitySnapshot 直接用。可审计性诉求不在 hi 的考虑范围内（user_rule），
   // 不为可审计性加 fetched_at / source_url 这种字段。
-  fs.writeFileSync(
-    SNAPSHOT_PATH,
-    `${JSON.stringify(items, null, 2)}\n`,
-    'utf8',
-  );
+  const snapshotJson = `${JSON.stringify(items, null, 2)}\n`;
+  const capabilityToolNames = items.map((i) => i.tool_name).sort();
+  const desiredManifestTools = [...STATIC_LOCAL_TOOLS, ...capabilityToolNames];
+
+  if (CHECK_ONLY) {
+    // PR check 路径：只比对磁盘 vs 期望，不写。
+    const snapshotDrift = fs.existsSync(SNAPSHOT_PATH)
+      ? fs.readFileSync(SNAPSHOT_PATH, 'utf8') !== snapshotJson
+      : true;
+    const currentManifest = JSON.parse(fs.readFileSync(MANIFEST_PATH, 'utf8'));
+    const currentManifestTools = currentManifest?.contracts?.tools ?? [];
+    const manifestDrift =
+      JSON.stringify(currentManifestTools) !== JSON.stringify(desiredManifestTools);
+    if (snapshotDrift || manifestDrift) {
+      const lines = [];
+      if (snapshotDrift) lines.push(`  - dist/capabilities.snapshot.json out of sync with prod`);
+      if (manifestDrift) {
+        const missing = desiredManifestTools.filter((t) => !currentManifestTools.includes(t));
+        const extra = currentManifestTools.filter((t) => !desiredManifestTools.includes(t));
+        lines.push(`  - openclaw.plugin.json contracts.tools out of sync`);
+        if (missing.length) lines.push(`      missing: ${missing.join(', ')}`);
+        if (extra.length) lines.push(`      extra:   ${extra.join(', ')}`);
+        lines.push(`      run \`npm run snapshot\` to regenerate, then commit`);
+      }
+      console.error(`[snapshot-capabilities] drift detected:\n${lines.join('\n')}`);
+      process.exit(1);
+    }
+    console.log(`[snapshot-capabilities] --check passed (${items.length} capabilities + ${STATIC_LOCAL_TOOLS.length} local tools, no drift)`);
+    return;
+  }
+
+  fs.writeFileSync(SNAPSHOT_PATH, snapshotJson, 'utf8');
   console.log(
     `[snapshot-capabilities] wrote ${items.length} capabilities → ${path.relative(REPO_ROOT, SNAPSHOT_PATH)}`,
   );
+
+  // 同步重写 openclaw.plugin.json 的 contracts.tools。read-modify-write，保留所有其它字段
+  // 跟 2-space indent 风格，避免 noise diff。order：STATIC_LOCAL_TOOLS 列出顺序 + 按
+  // tool_name 字典序的 capability tools（确定性，避免每次 prod 微调返回顺序导致 manifest
+  // 抖动）。
+  const manifest = JSON.parse(fs.readFileSync(MANIFEST_PATH, 'utf8'));
+  if (!manifest.contracts || typeof manifest.contracts !== 'object') {
+    throw new Error('openclaw.plugin.json missing contracts object');
+  }
+  const previousTools = Array.isArray(manifest.contracts.tools) ? manifest.contracts.tools : [];
+  manifest.contracts.tools = desiredManifestTools;
+  const manifestJson = `${JSON.stringify(manifest, null, 2)}\n`;
+  fs.writeFileSync(MANIFEST_PATH, manifestJson, 'utf8');
+
+  const changed = JSON.stringify(previousTools) !== JSON.stringify(desiredManifestTools);
+  if (changed) {
+    const added = desiredManifestTools.filter((t) => !previousTools.includes(t));
+    const removed = previousTools.filter((t) => !desiredManifestTools.includes(t));
+    console.log(
+      `[snapshot-capabilities] updated contracts.tools in ${path.relative(REPO_ROOT, MANIFEST_PATH)} (${desiredManifestTools.length} tools)`,
+    );
+    if (added.length) console.log(`  + added: ${added.join(', ')}`);
+    if (removed.length) console.log(`  - removed: ${removed.join(', ')}`);
+  } else {
+    console.log(
+      `[snapshot-capabilities] contracts.tools already in sync (${desiredManifestTools.length} tools)`,
+    );
+  }
 }
 
 main().catch((err) => {
