@@ -1,0 +1,285 @@
+name: release
+
+# 触发：push 到 main 时跑一次 version-bump detection。package.json 的 version 字段在本次
+# commit 里发生了变化才会发版；否则全部 step 都 skip（idempotent，未 bump 的纯文档/测试
+# commit 不会重复 publish）。
+#
+# 发版目标（一次性两个 registry，缺一即 fail，避免 npm 发了 ClawHub 没发那种半成品状态）：
+# 1. npm prod scope `@hirey-ai/hirey`（OpenClaw 5.2~5.3 fallback / Claude Desktop 等也能用）
+# 2. ClawHub package `clawhub:hirey`（OpenClaw 5.4+ ClawPack 首选路径）
+#
+# npm 走 Trusted Publishing（OIDC，无 long-lived token）。前置：在 npmjs.com 上给
+# @hirey-ai/hirey 这个 package 设置 "Trusted Publisher"，指向：
+#   - Organization or user: hirey-ai
+#   - Repository: hi-openclaw-plugin
+#   - Workflow filename: release.yml
+#   - Environment: (留空)
+# 没配 trusted publisher 直接 `npm publish` 会 401，CI 会硬失败让人去 npmjs 上配。
+#
+# ClawHub 没有 OIDC，仍用 PAT；token 在 CLAWHUB_TOKEN secret。
+#
+# 需要的 repo secrets：
+#   - CLAWHUB_TOKEN           clawhub.ai PAT，必须有 publish 权限
+#
+# 上次踩坑（2026-05-28）：1.0.34/1.0.35/1.0.36 三次 bump 后只手动 npm publish 了，
+# 没人记得 publish ClawHub，老 OpenClaw 用户 install clawhub:hirey 永远停在 1.0.33。
+# 这条 workflow 就是消灭那条 manual-step。
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write  # npm Trusted Publishing：OIDC token 必须由 GitHub Actions 签发
+
+concurrency:
+  group: hi-openclaw-plugin-release
+  cancel-in-progress: false
+
+jobs:
+  detect-bump:
+    runs-on: ubuntu-latest
+    outputs:
+      bumped: ${{ steps.compare.outputs.bumped }}
+      version: ${{ steps.compare.outputs.version }}
+      sha: ${{ steps.compare.outputs.sha }}
+      changelog: ${{ steps.compare.outputs.changelog }}
+    steps:
+      - name: Checkout main with previous commit
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      - name: Detect package.json version bump
+        id: compare
+        run: |
+          current=$(jq -r '.version' package.json)
+          if git rev-parse HEAD~1 >/dev/null 2>&1; then
+            previous=$(git show HEAD~1:package.json | jq -r '.version' 2>/dev/null || echo "")
+          else
+            previous=""
+          fi
+          echo "current=$current"
+          echo "previous=$previous"
+          if [[ "$current" != "$previous" && -n "$current" ]]; then
+            echo "bumped=true" >> "$GITHUB_OUTPUT"
+            echo "version=$current" >> "$GITHUB_OUTPUT"
+            echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+            # 提取 commit subject 当 changelog；clawhub publish 用得到。
+            cl=$(git log -1 --pretty=%s)
+            # multiline-safe via heredoc to $GITHUB_OUTPUT (action runner pattern)
+            {
+              echo "changelog<<EOF"
+              echo "$cl"
+              echo "EOF"
+            } >> "$GITHUB_OUTPUT"
+            echo "Bumped: $previous → $current"
+          else
+            echo "bumped=false" >> "$GITHUB_OUTPUT"
+            echo "No version bump in this commit; skipping publish."
+          fi
+
+  publish-npm:
+    needs: detect-bump
+    if: needs.detect-bump.outputs.bumped == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write  # OIDC token 由这个 job 显式申请；GitHub 给 npmjs.com 的 audience
+    strategy:
+      fail-fast: false
+      matrix:
+        channel: [early, prod]
+    steps:
+      - name: Checkout target repo into hi-openclaw-plugin/
+        uses: actions/checkout@v4
+        with:
+          path: hi-openclaw-plugin
+
+      - name: Clone hi-platform (provides release/render-npm-channel.mjs + channels.json)
+        env:
+          TOKEN: ${{ secrets.HI_INFRA_DEPLOY_TOKEN }}
+        run: |
+          [[ -n "${TOKEN}" ]] || { echo "HI_INFRA_DEPLOY_TOKEN secret missing" >&2; exit 1; }
+          git clone --depth=1 --branch prod \
+            "https://x-access-token:${TOKEN}@github.com/Ya-Link/hi-platform.git" hi-platform
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"  # node 22 ships npm 11 — full trusted publishing support
+          registry-url: "https://registry.npmjs.org"
+
+      - name: Install jq
+        run: sudo apt-get update && sudo apt-get install -y jq
+
+      - name: Pin npm CLI ≥ 11.5.1 (trusted publishing requires it)
+        run: |
+          npm install -g npm@latest
+          npm --version
+
+      - name: Render channel artifact
+        env:
+          CHANNEL: ${{ matrix.channel }}
+        run: |
+          # render-npm-channel.mjs 拷贝 source 到 temp dir，rewrite package.json name/bin/deps
+          # 以及所有源文件里的 @hirey/hi-* import 改成 @hirey-ai/* (channel=prod) 或保持 @hirey/*
+          # (channel=early)。openclaw plugin 渲染后包名变成：
+          #   early → @hirey/hirey
+          #   prod  → @hirey-ai/hirey
+          OUT="${RUNNER_TEMP}/rendered-${CHANNEL}"
+          node hi-platform/release/render-npm-channel.mjs \
+            --repo=hi-openclaw-plugin \
+            --channel="${CHANNEL}" \
+            --src="${GITHUB_WORKSPACE}/hi-openclaw-plugin" \
+            --out="${OUT}"
+          echo "RENDERED_DIR=${OUT}" >> "$GITHUB_ENV"
+          echo "Rendered package.json:"
+          jq '{name, version, publishConfig}' "${OUT}/package.json"
+
+      - name: Verify rendered version matches detect-bump
+        env:
+          EXPECTED: ${{ needs.detect-bump.outputs.version }}
+        run: |
+          got=$(jq -r '.version' "${RENDERED_DIR}/package.json")
+          [[ "$got" == "$EXPECTED" ]] || { echo "version drift: $got vs $EXPECTED" >&2; exit 1; }
+
+      - name: Install + build in rendered dir
+        working-directory: ${{ env.RENDERED_DIR }}
+        run: |
+          # rendered dir 不带 node_modules，build 必须在这跑（不能复用 source 的 dist —— scope
+          # 字符串都换过了）。prepack 里的 build + snapshot 也会跑，npm install + run build
+          # 做一次显式，prepack 跑第二次是 idempotent。
+          npm install --no-audit --no-fund
+          if jq -e '.scripts.build' package.json >/dev/null 2>&1; then
+            npm run build
+          fi
+
+      - name: npm publish (OIDC trusted publishing — no token)
+        working-directory: ${{ env.RENDERED_DIR }}
+        run: |
+          # OIDC 路径：npm CLI 看到 ACTIONS_ID_TOKEN_REQUEST_URL/_TOKEN env vars 自动从
+          # GitHub OIDC provider 拿 token 换 npmjs.com 发布权限。前置：npmjs.com 上 package
+          # settings → Trusted Publishers 配当前 repo + workflow filename。没配会 401。
+          # --provenance 同时签发 SLSA provenance attestation。
+          npm publish --provenance --access public --tag latest
+
+      - name: Verify npm registry shows new version on ${{ matrix.channel }}
+        env:
+          EXPECTED: ${{ needs.detect-bump.outputs.version }}
+          CHANNEL: ${{ matrix.channel }}
+        run: |
+          if [[ "${CHANNEL}" == "early" ]]; then
+            pkg="@hirey/hirey"
+          else
+            pkg="@hirey-ai/hirey"
+          fi
+          for i in {1..30}; do
+            got=$(npm view "${pkg}" version 2>/dev/null || echo "")
+            if [[ "$got" == "$EXPECTED" ]]; then
+              echo "npm ${pkg}@${EXPECTED} visible (attempt $i)"
+              exit 0
+            fi
+            echo "Attempt $i: npm view ${pkg} returned '${got}', want '${EXPECTED}'; retrying..."
+            sleep 10
+          done
+          echo "ERROR: npm did not surface ${pkg}@${EXPECTED} within 5min" >&2
+          exit 1
+
+  publish-clawhub:
+    needs: detect-bump
+    if: needs.detect-bump.outputs.bumped == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout target repo
+        uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install clawhub CLI globally
+        run: npm install -g clawhub
+
+      - name: Write clawhub config (token from secret)
+        env:
+          CLAWHUB_TOKEN: ${{ secrets.CLAWHUB_TOKEN }}
+        run: |
+          # clawhub CLI 通过 CLAWHUB_CONFIG_PATH env var 覆盖默认配置路径
+          # (clawhub/dist/config.js)。CI 显式落到 runner workspace 内的临时文件，
+          # 避免在 $HOME 留持久化 state。
+          [[ -n "${CLAWHUB_TOKEN}" ]] || { echo "CLAWHUB_TOKEN secret missing" >&2; exit 1; }
+          mkdir -p "${RUNNER_TEMP}/clawhub"
+          cat > "${RUNNER_TEMP}/clawhub/config.json" <<EOF
+          {
+            "registry": "https://clawhub.ai",
+            "token": "${CLAWHUB_TOKEN}"
+          }
+          EOF
+          chmod 600 "${RUNNER_TEMP}/clawhub/config.json"
+          echo "CLAWHUB_CONFIG_PATH=${RUNNER_TEMP}/clawhub/config.json" >> "$GITHUB_ENV"
+
+      - name: Verify clawhub auth
+        run: clawhub whoami
+
+      - name: Stage publish dir (npm pack — respects package.json files[])
+        run: |
+          # ClawHub publish 接 dir。借 `npm pack` 用 files[] 过滤一次，避免把 node_modules /
+          # .git / 测试源码打进去。注意：ClawPack 走的是 source artifact（@hirey/* 早期 scope
+          # 的 import + bundled node_modules），不需要 prod 渲染——OpenClaw 装上以后直接 extract
+          # tarball，bundled deps 解析 import，跟 npm scope 名无关。
+          mkdir -p "${RUNNER_TEMP}/staging"
+          cd "${RUNNER_TEMP}/staging"
+          npm pack "${GITHUB_WORKSPACE}"
+          tar -xzf hirey-*.tgz
+          rm hirey-*.tgz
+          ls package/
+
+      - name: Publish to ClawHub
+        env:
+          VERSION: ${{ needs.detect-bump.outputs.version }}
+          SHA: ${{ needs.detect-bump.outputs.sha }}
+          CHANGELOG: ${{ needs.detect-bump.outputs.changelog }}
+        run: |
+          cd "${RUNNER_TEMP}/staging/package"
+          clawhub --no-input package publish . \
+            --family code-plugin \
+            --name hirey \
+            --display-name "Hi Openclaw Plugin" \
+            --version "$VERSION" \
+            --changelog "$CHANGELOG" \
+            --host-targets openclaw \
+            --source-repo hirey-ai/hi-openclaw-plugin \
+            --source-commit "$SHA" \
+            --source-ref main \
+            --tags latest
+
+      - name: Verify ClawHub registry shows new version
+        env:
+          EXPECTED: ${{ needs.detect-bump.outputs.version }}
+        run: |
+          for i in {1..30}; do
+            got=$(clawhub package inspect hirey --json 2>/dev/null | jq -r '.package.latestVersion // empty')
+            if [[ "$got" == "$EXPECTED" ]]; then
+              echo "ClawHub clawhub:hirey@$EXPECTED visible (attempt $i)"
+              exit 0
+            fi
+            echo "Attempt $i: clawhub inspect returned '$got', want '$EXPECTED'; retrying..."
+            sleep 10
+          done
+          echo "ERROR: ClawHub did not surface clawhub:hirey@$EXPECTED within 5min" >&2
+          exit 1
+
+  release-summary:
+    needs: [detect-bump, publish-npm, publish-clawhub]
+    if: needs.detect-bump.outputs.bumped == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Summary
+        env:
+          VERSION: ${{ needs.detect-bump.outputs.version }}
+        run: |
+          echo "## Released hi-openclaw-plugin@${VERSION}" >> "$GITHUB_STEP_SUMMARY"
+          echo "- npm: \`@hirey-ai/hirey@${VERSION}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- ClawHub: \`clawhub:hirey@${VERSION}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Verify: https://clawhub.ai/plugins/hirey" >> "$GITHUB_STEP_SUMMARY"
