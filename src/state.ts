@@ -135,6 +135,9 @@ export async function updateState(
 }
 
 // 比较两 URL 的 origin（scheme + host + port），用来判断 identity 是不是当前 platform 颁的。
+// 2026-05：保留这个 helper 给老调用方 / test，但**不再用它做 pre-emptive quarantine 决策**——
+// issuer 和 platform_base_url 经常合法地分到不同 subdomain（e.g., issuer=`auth.hirey.ai`、
+// base=`hi.hirey.ai`），URL string 比较太脆。quarantine 现在只在 OAuth 真 401 之后触发。
 export function urlsHaveSameOrigin(a: string, b: string): boolean {
   if (!a || !b) return false;
   try {
@@ -148,30 +151,32 @@ export function urlsHaveSameOrigin(a: string, b: string): boolean {
 
 export type StaleIdentityQuarantine = {
   backup_path: string;
-  reason: 'platform_base_url_mismatch';
+  reason: 'platform_base_url_mismatch' | 'oauth_unauthorized';
   previous_issuer: string;
   previous_agent_id: string;
   previous_installation_id: string;
 };
 
 // 同台机器先后装过两套 channel（早期 hi.hireyapp.us / 现在 hi.hirey.ai）会让 state 里
-// 的 identity 是另一个 platform 颁的，OAuth 必 401。这里检测 issuer mismatch 时把旧 state
-// 文件 rename 成 .stale-<host>-<ts>.bak，返回干净 state，下一轮 install 自动 fresh register。
-export async function quarantineStaleIdentityIfNeeded(
+// 的 identity 是另一个 platform 颁的，OAuth 必 401。这里把旧 state 文件 rename 成
+// .stale-<host>-<ts>.bak，返回干净 state，下一轮 install 自动 fresh register。
+//
+// **2026-05 改成 reactive**：以前 readState 之后就 pre-emptive 比 issuer ↔ base URL string，
+// 不同 origin 就 quarantine——但平台合法变更过 issuer subdomain（auth.hirey.ai 等），导致
+// 全网用户每次重启都炸 identity、孤儿 agent 满天飞。新策略是：保留 identity 状态进 OAuth，
+// 真拿到 401 / invalid_client 再 quarantine——能用就不动。这个函数现在不主动比 URL，只在
+// OAuth 失败之后被显式调用做迁移落地。
+export async function quarantineStaleIdentity(
   stateDir: string,
   profile: string,
   state: HiPersistedState,
-  currentPlatformBaseUrl: string,
+  reason: StaleIdentityQuarantine['reason'],
 ): Promise<{ state: HiPersistedState; quarantined: StaleIdentityQuarantine | null }> {
   if (!state.identity) return { state, quarantined: null };
   const persistedIssuer = (state.identity.issuer || '').trim();
-  const currentBase = (currentPlatformBaseUrl || '').trim();
-  if (!persistedIssuer || !currentBase) return { state, quarantined: null };
-  if (urlsHaveSameOrigin(persistedIssuer, currentBase)) return { state, quarantined: null };
-
   const stateFile = resolveStateFile(stateDir, profile);
   let envTag = '';
-  try { envTag = new URL(persistedIssuer).host.replace(/[^a-zA-Z0-9._-]/g, '_'); } catch {}
+  try { envTag = new URL(persistedIssuer || 'about:blank').host.replace(/[^a-zA-Z0-9._-]/g, '_'); } catch {}
   const ts = new Date().toISOString().replace(/[:.]/g, '-');
   const backupPath = `${stateFile}.stale-${envTag || 'unknown'}-${ts}.bak`;
   try {
@@ -184,10 +189,29 @@ export async function quarantineStaleIdentityIfNeeded(
   }
   const quarantined: StaleIdentityQuarantine = {
     backup_path: backupPath,
-    reason: 'platform_base_url_mismatch',
+    reason,
     previous_issuer: persistedIssuer,
     previous_agent_id: state.identity.agent_id,
     previous_installation_id: state.identity.installation_id,
   };
+  console.warn(JSON.stringify({
+    event: 'hi_identity_quarantined',
+    reason,
+    previous_agent_id: state.identity.agent_id,
+    previous_issuer: persistedIssuer,
+    backup_path: backupPath,
+  }));
   return { state: buildEmptyState(state.profile), quarantined };
+}
+
+// 老入口：保留只为 backward compatibility，**新代码不要调**。原 pre-emptive URL 比较已经
+// 不可靠（参见 quarantineStaleIdentity 注释），新代码全部走 OAuth 401 → quarantineStaleIdentity。
+// 这里直接 no-op，把 identity 原样返回。
+export async function quarantineStaleIdentityIfNeeded(
+  _stateDir: string,
+  _profile: string,
+  state: HiPersistedState,
+  _currentPlatformBaseUrl: string,
+): Promise<{ state: HiPersistedState; quarantined: StaleIdentityQuarantine | null }> {
+  return { state, quarantined: null };
 }
