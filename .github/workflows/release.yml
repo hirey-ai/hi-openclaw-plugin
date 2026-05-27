@@ -222,6 +222,15 @@ jobs:
       - name: Verify clawhub auth
         run: clawhub whoami
 
+      - name: Install deps in source tree (prepack/tsc needs node_modules)
+        working-directory: ${{ github.workspace }}
+        run: |
+          # `npm pack ${GITHUB_WORKSPACE}` 触发 prepack → `npm run build` → tsc，tsc 解析
+          # @types/node + @hirey/hi-agent-sdk 时需要 node_modules 里有这些 package。新 checkout
+          # 不带 node_modules，所以这一步必须显式装。publish-npm 那两个 job 在 rendered dir
+          # 已经做过同样的事；ClawHub 这条路径之前漏了，1.0.38 首发就在这步挂了。
+          npm install --no-audit --no-fund
+
       - name: Stage publish dir (npm pack — respects package.json files[])
         run: |
           # ClawHub publish 接 dir。借 `npm pack` 用 files[] 过滤一次，避免把 node_modules /
