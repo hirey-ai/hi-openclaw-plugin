@@ -743,12 +743,174 @@ export function buildHiPullEventsTool(config: Required<HiOpenClawPluginConfig>):
   };
 }
 
+// ---------- hi_agent_recover ----------
+// 跟 hi_agent_reset 是反向操作：1.0.x 之前的 quarantine 逻辑会在 issuer ↔ platform_base_url
+// origin 不同时把 state file 改名成 .stale-<host>-<ts>.bak 再 fresh register（导致旧 listings
+// 跟 pairings 留在已经成 orphan 的旧 agent 上）。1.0.35 之后的 reactive quarantine 不再
+// pre-emptive 触发，但**老用户磁盘上的 .stale-*.bak 还在**，需要一条能 surface + 还原它们的
+// 工具：列出来 → 选哪一个 → rename 回 active state → 用旧 token 试 OAuth → 如果 platform 还
+// 承认就成功，旧 listings 跟 inbox 自然回来。
+//
+// 设计要点：
+// - **action=list**：扫 stateDir 下所有 .stale-*.bak，parse 文件内容拿 previous_agent_id /
+//   previous_issuer / activated_at，返给 LLM 一组卡片。不读破坏性的就只是 fs.readdir+JSON.parse。
+// - **action=restore**：先把当前 active state 改名（保护 currently-running identity，叫
+//   .pre-recover-<ts>.bak），再把选中的 .stale 改回 active，最后调一次 OAuth 验证。如果
+//   OAuth 401，恢复回原来的（避免用户卡进无效身份）；OAuth 200 就成。
+// - 故意不暴露 force / skip_verify：恢复一个旧 identity 但平台已经把它清掉了的情况，没有
+//   "强制保留"的有意义语义——下一次 tool call 还是会 401。让 LLM 引导用户去 hi_agent_install
+//   重起。
+export function buildHiAgentRecoverTool(config: Required<HiOpenClawPluginConfig>): PluginToolDefinition {
+  const stateDir = defaultStateDir(config);
+  return {
+    name: 'hi_agent_recover',
+    label: 'Hi agent recover',
+    description:
+      'Recover an orphaned Hi identity from a .stale-*.bak backup left behind by the old pre-emptive quarantine path. Use this when the user reports "my agent_id changed after a restart" or "my old listings/inbox disappeared". `action=list` enumerates available backups; `action=restore` swaps the chosen backup back into the active state file and re-validates it against the Hi platform via OAuth. Restore is safe — if the old token no longer authenticates, the change is rolled back and the user must run hi_agent_install for a fresh agent.',
+    parameters: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        action: {
+          type: 'string',
+          enum: ['list', 'restore'],
+          description: "'list' = enumerate available backups; 'restore' = swap one back in.",
+        },
+        backup_path: {
+          type: 'string',
+          description: 'Required for action=restore — full path to a backup returned by list.',
+        },
+      },
+      required: ['action'],
+    },
+    async execute(_id, params): Promise<PluginToolResult> {
+      const args = (params || {}) as { action: 'list' | 'restore'; backup_path?: string };
+      try {
+        if (args.action === 'list') {
+          let entries: string[] = [];
+          try { entries = await fs.readdir(stateDir); } catch (err: any) {
+            if (err?.code === 'ENOENT') return asJsonResult({ ok: true, state_dir: stateDir, backups: [] });
+            throw err;
+          }
+          const backups: any[] = [];
+          for (const entry of entries) {
+            if (!entry.endsWith('.bak')) continue;
+            if (!entry.includes('.stale-')) continue;
+            const full = path.join(stateDir, entry);
+            const stat = await fs.stat(full).catch(() => null);
+            if (!stat?.isFile()) continue;
+            let parsed: any = null;
+            try {
+              parsed = JSON.parse(await fs.readFile(full, 'utf8'));
+            } catch {
+              // 不可解析的就当成空 metadata，但仍 surface 路径让用户处理
+            }
+            backups.push({
+              backup_path: full,
+              size_bytes: stat.size,
+              mtime: stat.mtime.toISOString(),
+              previous_agent_id: parsed?.identity?.agent_id ?? null,
+              previous_installation_id: parsed?.identity?.installation_id ?? null,
+              previous_issuer: parsed?.identity?.issuer ?? null,
+              previous_display_name: parsed?.identity?.display_name ?? null,
+              previous_activated_at: parsed?.identity?.activated_at ?? null,
+            });
+          }
+          // 最近的（按 mtime）排前，方便 LLM 推荐"上次的旧身份"
+          backups.sort((a, b) => (b.mtime || '').localeCompare(a.mtime || ''));
+          return asJsonResult({
+            ok: true,
+            state_dir: stateDir,
+            backups,
+            note: backups.length === 0
+              ? 'No quarantine backups found. If the user is missing listings/inbox the orphan is on a different host or the bak file was already cleaned.'
+              : 'Show backups to the user; let them pick by previous_agent_id or previous_activated_at. Pass backup_path to action=restore.',
+          });
+        }
+
+        if (args.action !== 'restore') {
+          return asErrorResult('hi_agent_recover_unknown_action', { action: args.action });
+        }
+        const backupPath = String(args.backup_path || '').trim();
+        if (!backupPath) {
+          return asErrorResult('hi_agent_recover_missing_backup_path', {
+            hint: 'Call action=list first to obtain a valid backup_path.',
+          });
+        }
+        // 防止恶意路径跳出 stateDir
+        const resolvedBackup = path.resolve(backupPath);
+        const resolvedStateDir = path.resolve(stateDir);
+        if (!resolvedBackup.startsWith(resolvedStateDir + path.sep) && resolvedBackup !== resolvedStateDir) {
+          return asErrorResult('hi_agent_recover_backup_outside_state_dir', {
+            backup_path: resolvedBackup,
+            state_dir: resolvedStateDir,
+          });
+        }
+        const backupExists = await fs.stat(resolvedBackup).then((s) => s.isFile()).catch(() => false);
+        if (!backupExists) {
+          return asErrorResult('hi_agent_recover_backup_not_found', { backup_path: resolvedBackup });
+        }
+
+        const activeStateFile = resolveStateFile(stateDir, config.profile);
+        const ts = new Date().toISOString().replace(/[:.]/g, '-');
+        const preRecoverBackup = `${activeStateFile}.pre-recover-${ts}.bak`;
+
+        // 1) 先把当前 active state 保护好（如果有的话）
+        let hadActive = false;
+        try {
+          await fs.rename(activeStateFile, preRecoverBackup);
+          hadActive = true;
+        } catch (err: any) {
+          if (err?.code !== 'ENOENT') throw err;
+        }
+
+        // 2) 把选定的 backup 拷贝回 active（用 copy 而不是 rename，保留 .bak 给用户审计）
+        await fs.copyFile(resolvedBackup, activeStateFile);
+
+        // 3) 用恢复的 identity 试一次 OAuth；通过就成、失败就 rollback
+        try {
+          const auth = await buildAuthorizedClients({
+            stateDir, profile: config.profile, platformBaseUrl: config.platformBaseUrl,
+          });
+          // 同时 cleanup：删 .stale 副本（已经 restore 到 active 了，留着以后混淆）
+          await fs.unlink(resolvedBackup).catch(() => undefined);
+          return asJsonResult({
+            ok: true,
+            restored_from: resolvedBackup,
+            agent_id: auth.state.identity?.agent_id ?? null,
+            installation_id: auth.state.identity?.installation_id ?? null,
+            display_name: auth.state.identity?.display_name ?? null,
+            issuer: auth.state.identity?.issuer ?? null,
+            previous_active_saved_as: hadActive ? preRecoverBackup : null,
+            note: 'Recovery succeeded — OAuth re-authenticated the restored identity. Old listings, pairings, and inbox should reappear on next status/feed call.',
+          });
+        } catch (err: any) {
+          // OAuth 没认证通过——平台可能已经把这个 agent 清掉了。Rollback。
+          await fs.unlink(activeStateFile).catch(() => undefined);
+          if (hadActive) {
+            await fs.rename(preRecoverBackup, activeStateFile).catch(() => undefined);
+          }
+          return asErrorResult('hi_agent_recover_oauth_rejected', {
+            backup_path: resolvedBackup,
+            previous_agent_id: undefined,
+            detail: String(err?.message || err),
+            hint: 'The platform no longer recognizes this old identity. Active state has been rolled back. Run hi_agent_install for a fresh agent.',
+          });
+        }
+      } catch (err: any) {
+        return asErrorResult('hi_agent_recover_failed', buildErrorDetailFields(err));
+      }
+    },
+  };
+}
+
 export function buildAllControlTools(config: Required<HiOpenClawPluginConfig>): PluginToolDefinition[] {
   return [
     buildHiAgentStatusTool(config),
     buildHiAgentInstallTool(config),
     buildHiAgentDoctorTool(config),
     buildHiAgentResetTool(config),
+    buildHiAgentRecoverTool(config),
     buildHiPullEventsTool(config),
   ];
 }
