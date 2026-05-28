@@ -48,7 +48,7 @@ jobs:
       changelog: ${{ steps.compare.outputs.changelog }}
     steps:
       - name: Checkout main with previous commit
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           fetch-depth: 2
 
@@ -94,7 +94,7 @@ jobs:
         channel: [early, prod]
     steps:
       - name: Checkout target repo into hi-openclaw-plugin/
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           path: hi-openclaw-plugin
 
@@ -106,7 +106,7 @@ jobs:
           git clone --depth=1 --branch prod \
             "https://x-access-token:${TOKEN}@github.com/Ya-Link/hi-platform.git" hi-platform
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v5
         with:
           node-version: "22"  # node 22 ships npm 11 — full trusted publishing support
           registry-url: "https://registry.npmjs.org"
@@ -193,8 +193,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout target repo
-        uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+        uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
         with:
           node-version: "20"
 
