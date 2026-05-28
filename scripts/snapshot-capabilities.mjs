@@ -55,6 +55,7 @@ const STATIC_LOCAL_TOOLS = [
   'hi_agent_doctor',
   'hi_agent_reset',
   'hi_agent_recover',
+  'hi_agent_state_resync',
   'hi_pull_events',
 ];
 

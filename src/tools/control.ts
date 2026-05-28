@@ -586,6 +586,28 @@ export function buildHiAgentDoctorTool(config: Required<HiOpenClawPluginConfig>)
           ]);
         }
 
+        // 2026-05：身份分叉检测。admin consolidate / mergeAgents 之后 agent_installations.agent_id
+        // 被改成 target，但本地 state.identity.agent_id 还是 merge 前快照——客户端没机制知道自己被
+        // 合并掉了。表现是 LLM 看到 "我以为是 ag_X 但 /me 说我是 ag_Y" 然后反复 reset / re-install /
+        // 再造孤儿。这里对比 local vs /me vs installation 三个 agent_id，任何不一致直接 blocker，
+        // hint 是调 hi_agent_state_resync 把本地刷回 canonical（不是 hi_agent_install 重装，那会
+        // 让现有 OAuth 凭证失效再造一条孤儿 installation）。include_remote=false 时跳过——
+        // 没远端数据没法比对。
+        if (args.include_remote !== false && me) {
+          const localAgentId = String(state.identity?.agent_id || '').trim() || null;
+          const remoteMeAgentId = String((me as any)?.agent?.agent_id || '').trim() || null;
+          const remoteInstallationAgentId = String((installation.installation as any)?.agent_id || '').trim() || null;
+          if (localAgentId && remoteMeAgentId && localAgentId !== remoteMeAgentId) {
+            blockers.push(
+              `agent_identity_split:local=${localAgentId},remote_me=${remoteMeAgentId},remote_installation=${remoteInstallationAgentId || 'unknown'}`,
+            );
+          } else if (remoteMeAgentId && remoteInstallationAgentId && remoteMeAgentId !== remoteInstallationAgentId) {
+            warnings.push(
+              `remote_agent_id_mismatch:me=${remoteMeAgentId},installation=${remoteInstallationAgentId}`,
+            );
+          }
+        }
+
         let deliveryProbe: any = null;
         if (args.probe_delivery !== false && activated) {
           try {
@@ -923,6 +945,99 @@ export function buildHiAgentRecoverTool(config: Required<HiOpenClawPluginConfig>
   };
 }
 
+// 2026-05：hi_agent_state_resync — server-side admin consolidate / mergeAgents 之后把
+// 本地持久化 identity 拉回 remote canonical（/me + /installation 当前真值）。专为
+// hi_agent_doctor 报 `agent_identity_split` blocker 之后兜底用；只刷 agent_id /
+// display_name / delivery_capabilities，不动 installation_id 跟长期凭证（client_id /
+// client_secret 等）。跟 hi_agent_recover 是两条互补恢复路径：
+//   - recover: 从 .stale-*.bak 备份文件 rollback 回旧身份（quarantine 早期路径）
+//   - state_resync: 把本地 forward sync 到 remote 已 merge 完的新身份
+// installation_id 漂移（极少见——client_credentials 凭证已经认不得当前 install）则
+// resync 救不了，必须重新走 hi_agent_install 拿新凭证。
+export function buildHiAgentStateResyncTool(config: Required<HiOpenClawPluginConfig>): PluginToolDefinition {
+  const stateDir = defaultStateDir(config);
+  return {
+    name: 'hi_agent_state_resync',
+    label: 'Hi agent state resync',
+    description:
+      'Pull canonical agent_id / installation_id / display_name from gateway /me + /installation and patch the local state file to match. Use this when hi_agent_doctor reports `agent_identity_split:local=...,remote_me=...` — that blocker means server-side admin consolidate (e.g. agentMerge) reassigned this installation to a different agent_id but the local state file is still on the pre-merge snapshot. Idempotent (no-op when local already matches remote). Does NOT touch installation_id or long-lived credentials (client_id / client_secret); if installation_id itself has drifted, fails with a clear error and asks for hi_agent_install instead.',
+    parameters: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {},
+    },
+    async execute(_id, _params): Promise<PluginToolResult> {
+      try {
+        const auth = await buildAuthorizedClients({ stateDir, profile: config.profile, platformBaseUrl: config.platformBaseUrl });
+        const [me, installation] = await Promise.all([
+          auth.gateway.me(),
+          auth.gateway.getInstallation(),
+        ]);
+        const remoteAgentId = String((me as any)?.agent?.agent_id || '').trim() || null;
+        const remoteInstallationId = String((installation.installation as any)?.installation_id || '').trim() || null;
+        const remoteDisplayName = String((me as any)?.agent?.display_name || '').trim() || null;
+        const remoteAgentKind = String((me as any)?.agent?.agent_kind || '').trim() || null;
+        const remoteActivatedAt = String((installation.installation as any)?.activated_at || '').trim() || null;
+        const remoteDeliveryCapabilities = (installation.installation as any)?.delivery_capabilities || null;
+        if (!remoteAgentId || !remoteInstallationId) {
+          return asErrorResult('state_resync_remote_unreadable', {
+            hint: 'gateway /me or /installation did not return canonical IDs; bearer may not be provisioned. Run hi_agent_install first.',
+          });
+        }
+        const before = auth.state;
+        const beforeIdentity = before.identity;
+        const beforeAgentId = beforeIdentity?.agent_id || null;
+        const beforeInstallationId = beforeIdentity?.installation_id || null;
+        if (!beforeIdentity) {
+          return asErrorResult('state_resync_no_local_identity', {
+            hint: 'local state has no identity yet; run hi_agent_install before resync.',
+          });
+        }
+        const agentIdDrift = beforeAgentId !== remoteAgentId;
+        const installationIdDrift = beforeInstallationId !== remoteInstallationId;
+        if (!agentIdDrift && !installationIdDrift) {
+          return asJsonResult({
+            ok: true,
+            patched: false,
+            reason: 'no_drift',
+            identity: { agent_id: beforeAgentId, installation_id: beforeInstallationId },
+          });
+        }
+        if (installationIdDrift) {
+          return asErrorResult('state_resync_installation_id_drift_unrecoverable', {
+            local_installation_id: beforeInstallationId,
+            remote_installation_id: remoteInstallationId,
+            hint: 'Local installation_id no longer matches the bearer; client_credentials cannot reauthenticate. Run hi_agent_install for a fresh agent/credentials.',
+          });
+        }
+        await updateState(stateDir, config.profile, (current) => ({
+          ...current,
+          identity: current.identity
+            ? {
+                ...current.identity,
+                agent_id: remoteAgentId,
+                display_name: remoteDisplayName || current.identity.display_name,
+                agent_kind: remoteAgentKind || current.identity.agent_kind,
+                activated_at: remoteActivatedAt || current.identity.activated_at,
+                delivery_capabilities: remoteDeliveryCapabilities || current.identity.delivery_capabilities,
+              }
+            : current.identity,
+          runtime: { ...current.runtime, updated_at: new Date().toISOString() },
+        }));
+        return asJsonResult({
+          ok: true,
+          patched: true,
+          reason: 'agent_id_resynced_from_remote',
+          before: { agent_id: beforeAgentId, installation_id: beforeInstallationId },
+          after: { agent_id: remoteAgentId, installation_id: remoteInstallationId },
+        });
+      } catch (err: any) {
+        return asErrorResult('hi_agent_state_resync_failed', buildErrorDetailFields(err));
+      }
+    },
+  };
+}
+
 export function buildAllControlTools(config: Required<HiOpenClawPluginConfig>): PluginToolDefinition[] {
   return [
     buildHiAgentStatusTool(config),
@@ -930,6 +1045,7 @@ export function buildAllControlTools(config: Required<HiOpenClawPluginConfig>): 
     buildHiAgentDoctorTool(config),
     buildHiAgentResetTool(config),
     buildHiAgentRecoverTool(config),
+    buildHiAgentStateResyncTool(config),
     buildHiPullEventsTool(config),
   ];
 }
