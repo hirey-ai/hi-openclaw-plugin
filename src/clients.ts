@@ -53,13 +53,19 @@ export async function loadStateWithQuarantine(
 // message 里通常带 status code + OAuth2 error code，我们 best-effort 匹配。
 function isOAuthIdentityRejection(err: unknown): boolean {
   if (!err) return false;
-  const status = (err as any)?.status ?? (err as any)?.response?.status;
-  if (status === 401 || status === 403) return true;
   const msg = String((err as any)?.message || err).toLowerCase();
-  return msg.includes('401')
-      || msg.includes('invalid_client')
-      || msg.includes('invalid_grant')
-      || msg.includes('unauthorized');
+  // HARD identity rejection: the OAuth server explicitly disowned this client.
+  // These are the only signals that should quarantine a stored identity.
+  if (msg.includes('invalid_client') || msg.includes('invalid_grant')) return true;
+  // SOFT 401/403/unauthorized (or a transport hiccup) is often TRANSIENT — an
+  // hi-auth blip, a clock-skew JWT reject, a brief network 401. Quarantining on
+  // these false-positives renames a HEALTHY identity and forces a needless
+  // re-register ("my agent changed for no reason"). Default: do NOT quarantine
+  // on a soft 401 — surface the error and let the next turn retry. Opt back into
+  // the old aggressive behavior with HI_OPENCLAW_QUARANTINE_ON_SOFT_401=1.
+  if (!/^(1|true|yes|on)$/i.test(process.env.HI_OPENCLAW_QUARANTINE_ON_SOFT_401 || '')) return false;
+  const status = (err as any)?.status ?? (err as any)?.response?.status;
+  return status === 401 || status === 403 || msg.includes('401') || msg.includes('unauthorized');
 }
 
 export async function buildAuthorizedClients(args: {
