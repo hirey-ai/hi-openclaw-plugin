@@ -1038,6 +1038,74 @@ export function buildHiAgentStateResyncTool(config: Required<HiOpenClawPluginCon
   };
 }
 
+// ---------- hi_agent_claim_export / hi_agent_claim_redeem (2026-06) ----------
+// 登录后"重挂凭单"：在已绑手机的 agent 上 export 一个一次性短过期凭单，到另一台新设备 redeem，
+// 把这台设备挂回同一个 agent（同一身份，数据都在），不必重新绑手机。直接打 gateway 的
+// /v1/agents/claim/*（与 connect/activate 同一 registry base），复用 buildAuthorizedClients 的 bearer。
+function claimRegistryBase(auth: { wellKnown?: unknown }, config: Required<HiOpenClawPluginConfig>): string {
+  const wk = auth.wellKnown as any;
+  return (wk?.platform?.registry_base_url || wk?.registry_base_url || config.platformBaseUrl) as string;
+}
+
+export function buildHiAgentClaimExportTool(config: Required<HiOpenClawPluginConfig>): PluginToolDefinition {
+  const stateDir = defaultStateDir(config);
+  return {
+    name: 'hi_agent_claim_export',
+    label: 'Hi agent claim export',
+    description:
+      '导出一个一次性、短过期的"重挂凭单"（claim token），用于把另一台新设备挂回**当前这个 agent**（同一身份）。要求当前 agent 已绑定手机号（=工作区所有权证明；没绑会 403，请先绑手机）。返回的 claim_token 像密码一样——谁 redeem 谁就接入这个 agent，只发给你自己的其它设备。典型场景：换电脑 / 重装 / 凭证丢了，不想变成一个新的空 agent、也不想重新绑手机——在老设备上 export，到新设备上调 hi_agent_claim_redeem，继续用同一个 agent（listings / 会话 / 对端回复都在）。',
+    parameters: { type: 'object', additionalProperties: false, properties: {} },
+    async execute(_id, _params): Promise<PluginToolResult> {
+      try {
+        const auth = await buildAuthorizedClients({ stateDir, profile: config.profile, platformBaseUrl: config.platformBaseUrl });
+        const res = await fetch(`${claimRegistryBase(auth, config)}/v1/agents/claim/export`, {
+          method: 'POST',
+          headers: { authorization: `Bearer ${auth.accessToken}`, 'content-type': 'application/json' },
+          body: '{}',
+        });
+        const data = (await res.json().catch(() => ({}))) as Record<string, unknown>;
+        if (!res.ok) return asErrorResult(String((data as any)?.error || 'claim_export_failed'), data);
+        return asJsonResult(data);
+      } catch (err: any) {
+        return asErrorResult('hi_agent_claim_export_failed', buildErrorDetailFields(err));
+      }
+    },
+  };
+}
+
+export function buildHiAgentClaimRedeemTool(config: Required<HiOpenClawPluginConfig>): PluginToolDefinition {
+  const stateDir = defaultStateDir(config);
+  return {
+    name: 'hi_agent_claim_redeem',
+    label: 'Hi agent claim redeem',
+    description:
+      '在一台**新设备 / 新安装**上消费另一台设备用 hi_agent_claim_export 导出的 claim_token，把当前安装重挂到那个 agent——之后你就是同一个 agent（之前的 listings、会话、对端回复都在，可直接接着回复）。一次性使用，用过即作废；过期 / 被吊销 / 已用过都会被拒。',
+    parameters: {
+      type: 'object',
+      additionalProperties: false,
+      properties: { claim_token: { type: 'string', description: '老设备 hi_agent_claim_export 返回的一次性凭单 secret。' } },
+      required: ['claim_token'],
+    },
+    async execute(_id, params): Promise<PluginToolResult> {
+      const claimToken = String((params as any)?.claim_token || '').trim();
+      if (!claimToken) return asErrorResult('missing_claim_token');
+      try {
+        const auth = await buildAuthorizedClients({ stateDir, profile: config.profile, platformBaseUrl: config.platformBaseUrl });
+        const res = await fetch(`${claimRegistryBase(auth, config)}/v1/agents/claim/redeem`, {
+          method: 'POST',
+          headers: { authorization: `Bearer ${auth.accessToken}`, 'content-type': 'application/json' },
+          body: JSON.stringify({ claim_token: claimToken }),
+        });
+        const data = (await res.json().catch(() => ({}))) as Record<string, unknown>;
+        if (!res.ok) return asErrorResult(String((data as any)?.error || 'claim_redeem_failed'), data);
+        return asJsonResult(data);
+      } catch (err: any) {
+        return asErrorResult('hi_agent_claim_redeem_failed', buildErrorDetailFields(err));
+      }
+    },
+  };
+}
+
 export function buildAllControlTools(config: Required<HiOpenClawPluginConfig>): PluginToolDefinition[] {
   return [
     buildHiAgentStatusTool(config),
@@ -1047,5 +1115,7 @@ export function buildAllControlTools(config: Required<HiOpenClawPluginConfig>): 
     buildHiAgentRecoverTool(config),
     buildHiAgentStateResyncTool(config),
     buildHiPullEventsTool(config),
+    buildHiAgentClaimExportTool(config),
+    buildHiAgentClaimRedeemTool(config),
   ];
 }
