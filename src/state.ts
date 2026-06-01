@@ -2,6 +2,7 @@
 // 跟 hi-mcp-server 的 state schema 完全兼容 —— OpenClaw 同台机器装过 hi-mcp-server bundle
 // 之后切到 native plugin 时，能直接复用已有 identity，不需要重新 register。
 
+import crypto from 'node:crypto';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
@@ -129,10 +130,33 @@ export async function readState(stateDir: string, profile: string): Promise<HiPe
   }
 }
 
+// Crash-safe atomic write: a SIGKILL / power loss mid-write must never leave a
+// truncated credential file (the "hi creds mysteriously vanished → forced
+// re-login" bug). Write to a unique temp, fsync, then atomically rename over the
+// target. mode 0o600 because the state carries client_secret.
+async function atomicWriteFile(file: string, data: string): Promise<void> {
+  await fs.mkdir(path.dirname(file), { recursive: true });
+  const tmp = `${file}.tmp-${process.pid}-${crypto.randomBytes(6).toString('hex')}`;
+  let fh: Awaited<ReturnType<typeof fs.open>> | undefined;
+  try {
+    fh = await fs.open(tmp, 'w', 0o600);
+    await fh.writeFile(data, 'utf8');
+    await fh.sync();
+    await fh.close();
+    fh = undefined;
+    await fs.rename(tmp, file);
+  } catch (error) {
+    if (fh) {
+      try { await fh.close(); } catch {}
+    }
+    try { await fs.unlink(tmp); } catch {}
+    throw error;
+  }
+}
+
 export async function writeState(stateDir: string, profile: string, state: HiPersistedState): Promise<void> {
   const file = resolveStateFile(stateDir, profile);
-  await fs.mkdir(path.dirname(file), { recursive: true });
-  await fs.writeFile(file, `${JSON.stringify(state, null, 2)}\n`, 'utf8');
+  await atomicWriteFile(file, `${JSON.stringify(state, null, 2)}\n`);
 }
 
 export async function updateState(
