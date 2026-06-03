@@ -36,6 +36,7 @@
       "google_link",
       "listing_taxonomy",
       "matching_sessions",
+      "merge_agents",
       "owner_documents",
       "owner_intro_videos",
       "owners",
@@ -46,7 +47,8 @@
       "social_permissions",
       "social_relationships",
       "staff_admin",
-      "thread_meetings"
+      "thread_meetings",
+      "workspace_overview"
     ]
   },
   "configSchema": {
