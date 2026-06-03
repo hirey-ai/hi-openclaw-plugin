@@ -8,6 +8,11 @@ import os from 'node:os';
 import path from 'node:path';
 
 export type HiIdentityState = {
+  // 2026-06 anonymous-first 改造：匿名阶段 agent_id / installation_id 为 ''（空串 = 还没
+  // 绑定身份、平台还没 materialize agent）。一旦用户绑定 Google/手机/邮箱，平台懒加载出
+  // 唯一 agent，下一次 buildAuthorizedClients()/me 会把真实 agent_id 回填、anonymous 置 false。
+  // 全程 client_id/client_secret（即 api_key 解出来的那对）不变 —— 这是"同一身份、零 churn"
+  // 的根。空串而非 null 是为了不破坏既有大量 `state.identity.agent_id` 的 string 类型读取点。
   agent_id: string;
   installation_id: string;
   display_name: string;
@@ -21,6 +26,14 @@ export type HiIdentityState = {
   jwks_url: string;
   activated_at: string | null;
   delivery_capabilities: Record<string, unknown> | null;
+  // true = 这套凭证是匿名 hi_ak_ key（POST /v1/agents/api-keys {anonymous:true} 铸的），
+  // 还没绑定任何人类身份、平台侧还没 materialize agent（agent_id===''）。读/搜索可用，写
+  // 会被平台 phone_binding_required gate 挡住直到绑定。绑定后回填 agent_id 并置 false。
+  // 老 state 文件（eager-register 时代）没这个字段 → 视作已绑定（false），不打扰存量用户。
+  anonymous: boolean;
+  // 原始 hi_ak_ 串（base64url(JSON{v,id,secret})）。client_id/client_secret 已经从它解出来
+  // 单独存了，api_key 留底用于诊断 / 跨设备复制粘贴。可能为 null（老 state 或 register 路径）。
+  api_key: string | null;
   // 上一次成功把本机 plugin metadata + delivery_capabilities 同步到平台时使用的 plugin 版本。
   // 启动 reconcile 用这个跟当前 PLUGIN_VERSION 比对：不同就推一次 updateInstallation 把新版本
   // metadata + 新 capability 声明送上去，避免出现"本地升级了但平台 installation 记录还按老
@@ -107,6 +120,12 @@ export async function readState(stateDir: string, profile: string): Promise<HiPe
             // 老 state 文件没有这个字段；视作 unknown，让 reconcile 跑一次把它写上。
             plugin_version_synced:
               (parsed.identity as Partial<HiIdentityState>).plugin_version_synced ?? null,
+            // anonymous-first 改造前的 state 文件没有 anonymous/api_key：
+            // - anonymous 缺省 false：存量用户都是 eager-register 出来的已绑定 agent，
+            //   绝不能被误判成"匿名、可重铸"，否则升级即 churn。
+            // - api_key 缺省 null：老凭证不是 hi_ak_ 铸的，没有原始串可留底。
+            anonymous: (parsed.identity as Partial<HiIdentityState>).anonymous ?? false,
+            api_key: (parsed.identity as Partial<HiIdentityState>).api_key ?? null,
           }
         : null,
       runtime: {

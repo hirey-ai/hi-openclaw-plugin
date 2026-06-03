@@ -15,11 +15,13 @@ import {
   type HiAgentPlatformWellKnown,
 } from '@hirey/hi-agent-sdk';
 import {
-  quarantineStaleIdentity,
   readState,
+  updateState,
+  type HiIdentityState,
   type HiPersistedState,
   type StaleIdentityQuarantine,
 } from './state.js';
+import { PLUGIN_VERSION } from './version.js';
 
 export type HiAuthorizedClients = {
   state: HiPersistedState;
@@ -68,14 +70,119 @@ function isOAuthIdentityRejection(err: unknown): boolean {
   return status === 401 || status === 403 || msg.includes('401') || msg.includes('unauthorized');
 }
 
+// single-flight：装好插件后的第一波 read/搜索可能多个 tool 并发触发 ensureCredential，
+// 用一把 in-process 锁（键到 stateDir|profile）保证只 register 一次、不并发铸两个 agent。
+const _ensureInflight = new Map<string, Promise<HiPersistedState>>();
+
+// 凭证装配（2026-06 anonymous→register-once 改造核心）。
+//
+// 本地已有 identity → 原样复用，**绝不重注册**。这是"同一个 agent、零 churn"的根：openclaw
+// 旧逻辑在 state 缺失 / OAuth 抖动 quarantine 时反复 register 新 agent，每次都多一个孤儿
+// （prod 观察到 91% 的 agent 是孤儿）。现在堵上所有"自动重注册"的口子：本函数有凭证就复用、
+// buildAuthorizedClients 不再 auto-quarantine 重注册、hi_agent_install 去掉 replace_existing_state、
+// reset 加重警告。
+//
+// 没有 identity → 注册一个稳定 agent（register-once）。openclaw 是 native plugin、直连
+// 平台/gateway（不像 codex 走 mcp.hirey.ai/mcp edge 懒加载 agent），read/search 必须有一个
+// 已注册 agent（browse_recent/search 要 runtime agent_id），所以这里注册一次并 activate，让
+// 读/搜索立刻可用。注册出来的 agent **未绑定身份**（没有 owner_customer_id/手机）：读/搜索
+// 放行，写操作被平台 phone_binding_required gate 挡住，直到用户绑 Google/手机/邮箱——绑定
+// 通过 dual-anchor 收敛到用户工作区，**同一个 agent 复用**。displayName/metadata 透传给 register
+// （metadata 典型用于邀请落地页的 channel_code 渠道归因）。
+export async function ensureCredential(args: {
+  stateDir: string;
+  profile: string;
+  platformBaseUrl: string;
+  displayName?: string;
+  metadata?: Record<string, unknown>;
+}): Promise<HiPersistedState> {
+  const existing = await readState(args.stateDir, args.profile);
+  if (existing.identity) return existing;
+  const lockKey = `${args.stateDir}|${args.profile}`;
+  const inflight = _ensureInflight.get(lockKey);
+  if (inflight) return inflight;
+  const p = (async () => {
+    // 拿到 slot 后再读一次：可能上一个并发请求刚注册完。
+    const recheck = await readState(args.stateDir, args.profile);
+    if (recheck.identity) return recheck;
+    const pub = await buildPublicClients(args.platformBaseUrl);
+    const callerMetadata =
+      args.metadata && typeof args.metadata === 'object' && !Array.isArray(args.metadata) ? args.metadata : {};
+    const reg = await pub.gateway.register({
+      display_name: args.displayName?.trim() || 'OpenClaw Hi Agent',
+      agent_kind: 'external',
+      capabilities: [],
+      metadata: {
+        ...callerMetadata,
+        host: 'openclaw',
+        plugin: 'hi-openclaw-plugin',
+        plugin_version: PLUGIN_VERSION,
+      },
+    });
+    const identity: HiIdentityState = {
+      agent_id: reg.agent.agent_id,
+      installation_id: reg.installation.installation_id,
+      display_name: reg.agent.display_name,
+      agent_kind: reg.agent.agent_kind,
+      client_id: reg.auth.client_id,
+      client_secret: reg.auth.client_secret,
+      installation_subject: reg.auth.installation_subject ?? reg.installation.installation_id,
+      issuer: reg.auth.issuer,
+      audience: reg.auth.audience,
+      token_url: reg.auth.token_url,
+      jwks_url: reg.auth.jwks_url,
+      activated_at: null,
+      delivery_capabilities: null,
+      plugin_version_synced: null,
+      anonymous: false,
+      api_key: null,
+    };
+    let next = await updateState(args.stateDir, args.profile, (cur) => ({
+      ...cur,
+      platform: {
+        platform_base_url: args.platformBaseUrl,
+        registry_base_url: args.platformBaseUrl,
+        fetched_at: new Date().toISOString(),
+      },
+      identity,
+    }));
+    // activate（idempotent）让 agent 立刻可用于 read/search。直接用刚拿到的凭证换 token + activate，
+    // 不走 buildAuthorizedClients（避免与本函数互相递归）。fail-soft：activate 失败不阻断、也
+    // **绝不**因此重注册——下次 hi_agent_install 会补激活。
+    try {
+      const token = await exchangeHiAgentClientCredentialsToken({
+        tokenUrl: identity.token_url,
+        clientId: identity.client_id,
+        clientSecret: identity.client_secret,
+      });
+      const clients = await createHiAgentClients({ platformBaseUrl: args.platformBaseUrl, token: token.access_token });
+      const act: any = await clients.gateway.activate({});
+      next = await updateState(args.stateDir, args.profile, (cur) => ({
+        ...cur,
+        identity: cur.identity
+          ? { ...cur.identity, activated_at: act?.installation?.activated_at ?? new Date().toISOString() }
+          : cur.identity,
+      }));
+    } catch {
+      // activate fail-soft
+    }
+    console.log(JSON.stringify({ event: 'hi_openclaw_agent_registered', profile: args.profile, agent_id: identity.agent_id }));
+    return next;
+  })().finally(() => { _ensureInflight.delete(lockKey); });
+  _ensureInflight.set(lockKey, p);
+  return p;
+}
+
 export async function buildAuthorizedClients(args: {
   stateDir: string;
   profile: string;
   platformBaseUrl: string;
 }): Promise<HiAuthorizedClients> {
-  const state = await readState(args.stateDir, args.profile);
+  // 没有 identity 时不再 throw hi_identity_missing，而是 register-once 一个稳定 agent —— 这样
+  // "装好插件直接搜索"就能用；register-once + 复用 = 零 churn。
+  const state = await ensureCredential(args);
   if (!state.identity) {
-    throw new Error('hi_identity_missing: run hi_agent_install before calling authorized tools');
+    throw new Error('hi_identity_unavailable: agent registration failed; retry hi_agent_status');
   }
   let token;
   try {
@@ -85,14 +192,15 @@ export async function buildAuthorizedClients(args: {
       clientSecret: state.identity.client_secret,
     });
   } catch (err) {
+    // 关键反 churn 改动：OAuth 失败**不再 auto-quarantine + 重注册**（那正是 openclaw 满天飞
+    // 孤儿 agent 的根因——一次抖动/吊销就换一个新 agent）。保留本地凭证、抛清晰错误：让用户
+    // 重试，或重新绑定 Google/手机/邮箱（dual-anchor 会把这台设备收敛回同一工作区/agent），
+    // 绝不悄悄换 agent。真要重置只能显式 hi_agent_reset（已加重警告）。
     if (isOAuthIdentityRejection(err)) {
-      // identity 真被 platform 拒了——quarantine 旧 state 文件、in-memory flag 让下一轮 tool
-      // response surface。caller 看到 hi_identity_quarantined 之后要走 hi_agent_install 重新注册。
-      const { quarantined } = await quarantineStaleIdentity(
-        args.stateDir, args.profile, state, 'oauth_unauthorized',
+      throw new Error(
+        'hi_identity_oauth_rejected: stored credentials were refused by OAuth. Do NOT reset — retry shortly, '
+        + 'or re-bind Google/phone/email to reconverge this workspace (the stable agent is kept, no new agent is minted).',
       );
-      if (quarantined) _lastQuarantineNotice = quarantined;
-      throw new Error('hi_identity_quarantined: OAuth refused stored credentials; run hi_agent_install to re-register');
     }
     throw err;
   }

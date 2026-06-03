@@ -52,6 +52,13 @@ export async function reconcileInstallationOnBoot(
     return { status: 'skipped', reason: 'no_identity' };
   }
 
+  // anonymous-first：匿名/未绑定凭证没有 installation（平台还没 materialize agent），
+  // updateInstallation 必然 404/无意义。这里直接 skip，等用户绑定身份、hi_agent_install
+  // finalize 写好 installation_id 之后，下次启动 reconcile 再正常跑。
+  if (state.identity.anonymous || !state.identity.installation_id || !state.identity.agent_id) {
+    return { status: 'skipped', reason: 'no_identity' };
+  }
+
   const synced = state.identity.plugin_version_synced;
   if (synced === PLUGIN_VERSION) {
     return { status: 'skipped', reason: 'version_already_synced' };

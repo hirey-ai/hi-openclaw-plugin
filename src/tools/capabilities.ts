@@ -109,6 +109,57 @@ function asErrorResult(error: string, details?: Record<string, unknown>): Plugin
   return { ...asJsonResult(payload), isError: true };
 }
 
+// 平台写操作 gate：匿名（未绑定身份）调用写类 capability 时，平台返回
+// phone_binding_required 一类的身份门禁错误（读/搜索匿名放行，写需要已验证身份）。
+// anonymous-first 改造后这是**预期**的正常分叉，不是 bug —— 把它识别出来，回一条
+// Google 优先的绑定引导，让 LLM 去绑定再重试，而不是当成普通失败甩给用户。
+function looksLikeBindingGate(err: unknown): boolean {
+  const fields = buildErrorDetailFields(err);
+  const hay = `${fields.error_message} ${(() => {
+    try { return JSON.stringify(fields.platform_response ?? ''); } catch { return ''; }
+  })()}`.toLowerCase();
+  // 显式 gate code（codex 线上 onboarding 文案钦定的 phone_binding_required）+ 等价变体。
+  if (/phone_binding_required|binding_required|requires?_?identity|identity_required/.test(hay)) return true;
+  // 自然语言变体：requires a phone-verified identity / must bind / not verified ...
+  if (/requires?\s+a?\s*phone|phone[-\s]?verified|verified\s+identity|must\s+(bind|verify)|not\s+verified/.test(hay)) {
+    return true;
+  }
+  // 403 + 身份/绑定/手机/邮箱 关键词：兜底（平台未来若换 code 也不漏）。
+  if (fields.status === 403 && /(identity|bind|verif|phone|email|anonymous|forbidden)/.test(hay)) return true;
+  return false;
+}
+
+// 写操作 gate 命中时回给 LLM 的结构化绑定引导。Google 默认、手机/邮箱次之，并明确
+// "绑定后重试不会新建 agent / 不会变成另一个 agent"，对齐零 churn 语义。
+function bindingGateResult(capabilityId: string, err: unknown): PluginToolResult {
+  return {
+    ...asJsonResult({
+      ok: false,
+      error: 'needs_binding',
+      needs_binding: true,
+      capability_id: capabilityId,
+      instruction_to_llm:
+        '这是写操作（建档/发 listing/联系人/约 meeting 等），需要先把身份绑定到 Hi。'
+        + '绑定后用同样的参数重试这条操作即可——绑定不会新建 agent，也不会把你变成另一个 agent。'
+        + '默认、最省事的方式是用 Google 登录：调用 google_link 工具。'
+        + '用户不想用 Google 时，可改用 phone_binding（先 action:"bind" 发码，再 action:"verify" 提交短信验证码）'
+        + '或 email_binding（邮箱验证码）。'
+        + '注意：这里的"绑定手机/邮箱/Google"是把身份绑到 Hi 账号/工作区，不是宿主自带的电话/Gmail/邮箱连接器。',
+      how_to_bind: {
+        recommended: 'google_link',
+        options: [
+          { tool: 'google_link', note: 'Sign in with Google（默认推荐，最省事）' },
+          { tool: 'phone_binding', note: '手机号验证码：action:"bind" 发码 → action:"verify" 提交 SMS code' },
+          { tool: 'email_binding', note: '邮箱验证码（或邮箱里的 Google 登录）' },
+        ],
+      },
+      retry_after_bind: '绑定成功后，用相同参数再次调用 ' + capabilityId + ' 对应的工具即可。',
+      ...buildErrorDetailFields(err),
+    }),
+    isError: true,
+  };
+}
+
 function buildCapabilityTool(
   spec: PublicAgentCapability,
   config: Required<HiOpenClawPluginConfig>,
@@ -141,6 +192,12 @@ function buildCapabilityTool(
         );
         return asJsonResult({ ok: true, ...(result as Record<string, unknown>), capability_id: spec.capability_id });
       } catch (err: any) {
+        // 写操作 gate：匿名调用写类 capability 命中平台 phone_binding_required 一类身份门禁
+        // 时，回 Google 优先的绑定引导（让 LLM 绑定再重试），而不是当成普通失败。这是
+        // anonymous-first 下的预期分叉。读/搜索匿名放行，不会走到这里。
+        if (looksLikeBindingGate(err)) {
+          return bindingGateResult(spec.capability_id, err);
+        }
         // 平台 4xx 的诊断 detail 全在 err.detail.data 里（缺哪个字段 / required_for_action /
         // enum 候选值等），err.message 只是 body.error 字段的一句话。早先这里只 surface
         // err.message，等同于把诊断 swallow 掉——LLM 收到 tool result 只剩"missing fields"

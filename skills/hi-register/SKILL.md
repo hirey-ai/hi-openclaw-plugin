@@ -1,54 +1,62 @@
 ---
 name: hi-register
-description: Register the Hi agent on this OpenClaw host AFTER the `clawhub:hirey` ClawPack plugin has been installed. Use whenever `hi_agent_install` is in your tool inventory but no Hi state exists yet (for example, the user just installed the plugin in the previous turn and is now sending the second message of the install flow), or whenever the user asks to "set up", "register", "complete the install of", "activate", or "connect" Hi. CRITICAL — `hi_agent_install` is the AGENT-side registration tool on the Hi platform; it is structurally different from `openclaw plugins install`, which is a system-side CLI that just lays the plugin on disk. Never confuse the two. Never report a fabricated `agent_id`.
+description: Set up Hi on this OpenClaw host AFTER the `clawhub:hirey` ClawPack plugin is installed. Use whenever `hi_agent_install` is in your tool inventory and you are setting Hi up, OR when a Hi write (post a profile/listing, contact someone, schedule) returned `needs_binding`/`phone_binding_required`, OR when the user asks to "set up", "register", "activate", "connect", "log in to", or "bind" Hi. CRITICAL — `hi_agent_install` gives this host ONE STABLE agent that is reused forever (no duplicate-agent churn). After it runs, reading & searching Hi work immediately; writing requires the user to bind Google/phone/email. It is structurally different from `openclaw plugins install`. Never report a fabricated `agent_id`.
 ---
 
-# Hi Register (post-install)
+# Hi setup (post-install)
 
-This skill is the **second turn** of the Hi install flow on OpenClaw 5.2+ ClawPack. It loads automatically when the `clawhub:hirey` plugin is installed and the next outer LLM run starts.
+This skill runs after the `clawhub:hirey` plugin is installed. The model mirrors Codex:
+
+- `hi_agent_install` gives this OpenClaw host **ONE stable Hi agent**, persisted locally and **reused forever** — restart / new window / re-runs all map to the **same `agent_id`** (this kills the old duplicate-agent churn).
+- After setup, **reading & searching Hi (people, listings, taxonomy) work immediately**.
+- The agent starts **unbound** (no verified identity). **Writing** (create/edit a profile, post a listing, contact anyone, schedule) is gated until the user **binds an identity** — default **Sign in with Google** (`google_link`), or **phone** (`phone_binding`), or **email** (`email_binding`). Binding attaches to the **same** agent — it never creates a new one.
 
 ## Use when
 
-- the `clawhub:hirey` plugin is installed locally and `hi_agent_install` is in your current run's tool inventory
-- the user is sending a fresh message after the plugin install ran in a previous turn (typical: the user said `continue` or anything else after being told "send another message to finish setup")
-- OR: the user explicitly asks to register / set up / activate / connect Hi
-- OR: a Hi tool returned an error like `hi_agent_state_missing` / `agent_not_registered`
+- the `clawhub:hirey` plugin is installed and `hi_*` tools are in your current run's inventory
+- the user just installed Hi and is continuing setup
+- a Hi write tool returned `needs_binding` / `phone_binding_required` (the user must bind before that write)
+- the user asks to set up / register / activate / connect / log in to / bind Hi
 
 ## Do not use when
 
-- the plugin is not installed yet (run `clawhub:hirey` install via the `openclaw-hi-install` skill first)
-- the agent is already registered and `hi_agent_status` reports active
+- the plugin is not installed yet (install `clawhub:hirey` via the `openclaw-hi-install` skill first)
 
-## Steps (turn 2 — registration)
+## Steps
 
-1. Verify `hi_*` tools are in your current outer run's tool inventory before you call anything (try a lightweight call like `hi_agent_status`). If they are not, you are still in the same outer run as `openclaw plugins install` — your tool inventory was frozen before the plugin loaded; STOP and tell the user "send another message — OpenClaw doesn't refresh my tool list mid-turn." Do **not** fabricate `agent_id`.
-2. Read the canonical full session key for the current chat from a structured host source: `openclaw status --json` → `sessions.recent[0].key`. Do not copy from human-readable status text (it can be truncated).
-3. Call `hi_agent_install` with at minimum:
-   - `host_session_key`: the session key from step 2
-   - `default_reply_channel: "last"`
-   - and if your structured host source provides them: `default_reply_to`, `default_reply_account_id`, `default_reply_thread_id`
-   - `route_missing_policy: "use_explicit_default_route"` so Hi binds the current chat as the default reply target
-4. Report the **real** values returned by the tool: `agent_id`, `hooks_ready`, `connected`, `activated`, `push_ready`. Never edit them. Never make them up.
-5. Run `hi_agent_doctor` (with `probe_delivery: true` if you want a full end-to-end check) to verify; if it reports blockers, surface them honestly to the user.
-6. If `hi_agent_install` returned a `welcome` field (shape: `{kind:"install_welcome_onboarding", instruction_to_llm, recent_activity, intent_options}`), follow `welcome.instruction_to_llm` exactly — it is the platform-authored onboarding script and supersedes any per-skill rephrasing. Use the `recent_activity` and `intent_options` that came back in `welcome` directly; do not call `agent_listings(action="browse_recent")` again to re-fetch them. Run the welcome conversation in the user's chat language.
+1. **Verify `hi_*` tools are in your current run's inventory** (try a lightweight `hi_agent_status`). If they are not, you are still in the same outer run as `openclaw plugins install` — your tool inventory was frozen before the plugin loaded; STOP and tell the user "send another message — OpenClaw doesn't refresh my tool list mid-turn." Do **not** fabricate `agent_id`.
+
+2. **Call `hi_agent_install`.** Pass `host_session_key` (from `openclaw status --json` → `sessions.recent[0].key`), `default_reply_channel: "last"`, and `route_missing_policy: "use_explicit_default_route"` so Hi binds this chat as the default reply target. It returns `mode:"registered"` with the **real** `agent_id`, plus `hooks_ready`, `activated`, `push_ready`. Report those exactly. Then:
+   - Tell the user **search/browse works right now** (offer to search for whatever they want — people, jobs, housing, dating, founders, etc.).
+   - Tell them **logging in is only needed to write** (post a profile/listing, contact someone, schedule), and the default is **Sign in with Google**.
+   - This same `agent_id` persists across restarts and new windows — reassure the user it will not change.
+
+3. **When the user wants to write** (or a write returned `needs_binding`/`phone_binding_required`): help them bind, **Google first**.
+   - **Default — Google:** call `google_link` (`action:"start"` → give the user the verification URL → `action:"poll"` until verified).
+   - **Phone:** call `phone_binding` (`action:"bind"` to send the SMS code → `action:"verify"` with the code).
+   - **Email:** call `email_binding` (email OTP).
+   - These bind the identity to the user's **Hi account/workspace** — they are NOT the host's own phone/Gmail/email connectors. Never route a Hi identity bind to a host connector.
+   - After binding, **retry the original write with the same params** — it now succeeds, on the **same** `agent_id`.
+
+4. **Choosing new vs previous agent.** Binding the same phone/email/Google merges this host into that identity's workspace. If the user already used Hi on **another device** and wants to keep **that** agent instead, use `previous_agent_choice` from the install result: run `hi_agent_claim_export` on the old device and `hi_agent_claim_redeem` here to switch this host to the previous agent (same listings/threads).
+
+5. **Welcome onboarding:** if `hi_agent_install` returned a `welcome` field (`{kind:"install_welcome_onboarding", instruction_to_llm, recent_activity, intent_options}`), follow `welcome.instruction_to_llm` exactly. Run the welcome conversation in the user's chat language.
 
 ## Anti-patterns
 
-- ❌ Reporting `agent_id` you did not get back from `hi_agent_install`. `agent_id` looks like `ag_<12-hex>`; if you have not actually run the tool, the only correct answer is "I cannot register yet — please send another message."
-- ❌ Pretending `hooks_ready=true` / `connected=true` / `activated=true` to make the install look one-shot. The user discovers the lie the first time they call any Hi tool.
-- ❌ Calling `openclaw plugins install …` from this turn to "redo the install" — the plugin is already installed; you just need to call `hi_agent_install` (the AGENT-side registration tool, not the system-side CLI).
-- ❌ Skipping the `welcome` onboarding when `hi_agent_install` returns one. Doctor being healthy is necessary but not sufficient — install is only "done for the user" after the welcome conversation has actually surfaced what Hi is and what they want it to find for them.
+- ❌ Forcing the user to log in just to search or browse. Reading works right after `hi_agent_install` — never gate it behind a bind.
+- ❌ Reporting an `agent_id` you did not get back from `hi_agent_install`.
+- ❌ Calling `hi_agent_reset` to "fix" something. Reset is destructive and unnecessary — the stable agent is reused automatically. Use `hi_agent_status` / `hi_agent_doctor` to diagnose. If a Hi call ever reports `hi_identity_oauth_rejected`, do NOT reset; retry shortly or have the user re-bind (Google/phone/email) — the same agent is kept.
+- ❌ Routing a Hi identity bind to the host's Gmail/phone/email connector. `google_link`/`phone_binding`/`email_binding` bind to the user's Hi workspace, not a host connector.
+- ❌ Calling `openclaw plugins install …` again to "redo the install" — the plugin is already installed; you just call `hi_agent_install`.
 
 ## Naming clarification (critical to avoid confusion)
 
-There are two install-shaped commands in scope, and they are **not** the same thing:
+Two install-shaped commands are **not** the same thing:
 
 | | `openclaw plugins install clawhub:hirey` | `hi_agent_install` (this tool) |
 |---|---|---|
 | Where it runs | OpenClaw CLI (system) | Hi platform (agent runtime) |
-| What it does | Lands the plugin tarball on disk + registers it with the gateway | Registers an AGENT identity for this OpenClaw host on the Hi platform; sets up hooks for push delivery; activates installation; subscribes to event topics |
-| When | Stage A (turn 1) | Stage B (turn 2) |
-| Required tool inventory | available in any LLM run | only in LLM runs whose inventory was materialized AFTER the plugin loaded |
-| Sufficient to use Hi? | NO — you have tools but no agent identity | YES — after this returns successfully, hi_* tools work |
-
-If only the system-side install ran, the user has a non-functional plugin: the tools surface but every call fails because there is no agent identity bound to this host. `hi_agent_install` is the step that makes Hi actually work.
+| What it does | Lands the plugin tarball on disk + registers it with the gateway | Gives this host ONE stable Hi agent (reused forever), activates it, wires push. Reads work immediately; writing needs the user to bind Google/phone/email |
+| When | Stage A (turn 1) | Stage B (turn 2+) |
+| Sufficient to use Hi? | NO — tools surface but no Hi agent | Reads: YES immediately. Writes: after the user binds Google/phone/email |

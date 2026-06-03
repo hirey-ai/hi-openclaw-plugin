@@ -15,7 +15,7 @@ import {
 } from '@hirey/hi-agent-contracts';
 import {
   buildAuthorizedClients,
-  buildPublicClients,
+  ensureCredential,
   loadStateWithQuarantine,
   peekQuarantineNotice,
 } from '../clients.js';
@@ -23,7 +23,6 @@ import {
   resolveStateDir,
   resolveStateFile,
   updateState,
-  type HiIdentityState,
 } from '../state.js';
 import { ensureOpenClawHooksConfigured, ensurePluginToolsAlsoAllowed, readGatewayPort, findRecentUserSessionKey } from '../utils/openclaw-config.js';
 import { buildErrorDetailFields } from '../utils/error-detail.js';
@@ -144,9 +143,12 @@ export function buildHiAgentStatusTool(config: Required<HiOpenClawPluginConfig>)
           quarantined_stale_identity: peekQuarantineNotice(),
           summary: {
             connected: !!state.identity,
+            // registered = 本机已有稳定 agent（register-once）。注意：registered≠identity-bound——
+            // agent 可能还没绑手机/邮箱/Google（写操作会被平台 gate 挡住），但读/搜索已可用。
+            registered: !!(state.identity && state.identity.agent_id),
             activated: !!state.identity?.activated_at,
-            agent_id: state.identity?.agent_id ?? null,
-            installation_id: state.identity?.installation_id ?? null,
+            agent_id: state.identity?.agent_id || null,
+            installation_id: state.identity?.installation_id || null,
           },
           state,
           remote: null as Record<string, unknown> | null,
@@ -180,9 +182,9 @@ export function buildHiAgentInstallTool(config: Required<HiOpenClawPluginConfig>
   const stateDir = defaultStateDir(config);
   return {
     name: 'hi_agent_install',
-    label: 'Hi agent install',
+    label: 'Hi agent setup',
     description:
-      'AGENT-side registration step on the Hi platform. Registers a fresh Hi agent (or reuses existing identity), activates installation, declares delivery capabilities, subscribes to default event topics, and persists identity for subsequent Hi tool calls. Idempotent — calling it after a healthy install just refreshes installation/subscription state. NOTE: structurally different from `openclaw plugins install clawhub:hirey` (which is the CLI that lays the plugin tarball on disk and registers it with the gateway). The CLI install puts hi_* tools on the gateway; THIS tool gives this OpenClaw host an agent identity on the Hi platform so those tools actually work. After `openclaw plugins install` succeeds in turn 1, hi_agent_install is the second step that completes registration in turn 2 — see the `hi-register` skill bundled with this plugin for the full flow. Never report a fabricated agent_id; if you cannot see this tool in your run inventory, the install just completed and you must wait for the user\'s next message before registration is possible.',
+      'AGENT-side setup step on the Hi platform. Ensures this OpenClaw host has ONE STABLE agent + credential (register-once) and activates + wires push for it. The credential is persisted locally and REUSED forever — restart / new window / repeated calls all map to the SAME agent_id (no duplicate-agent churn; that churn was the old bug). After it returns, reading & searching Hi (people, listings, taxonomy) work immediately. The agent starts UNBOUND (no verified identity): WRITING — creating/editing a profile, posting a listing, contacting anyone, scheduling — is gated by the platform and requires the user to bind an identity first, default Google (google_link) or phone (phone_binding) or email (email_binding). A `phone_binding_required` / `needs_binding` error on a write means exactly this: bind once, then retry the write — binding attaches to the SAME agent (no new agent). Fully idempotent. NOTE: structurally different from `openclaw plugins install clawhub:hirey` (the CLI that lays the plugin tarball on disk + registers it with the gateway). The CLI install puts hi_* tools on the gateway; THIS tool sets up the Hi-platform agent so those tools work. Always report the REAL agent_id returned by this tool; never fabricate one. If you cannot see this tool in your run inventory yet, the install just completed — wait for the user\'s next message.',
     parameters: {
       type: 'object',
       additionalProperties: false,
@@ -198,11 +200,6 @@ export function buildHiAgentInstallTool(config: Required<HiOpenClawPluginConfig>
         host_session_key: {
           type: 'string',
           description: 'OpenClaw current chat canonical session key (sessions.recent[0].key). Used to bind this chat as default reply route. Optional in plugin mode — the gateway already knows the current session.',
-        },
-        replace_existing_state: {
-          type: 'boolean',
-          description: 'Force fresh registration even if existing identity is present. Default false (idempotent).',
-          default: false,
         },
         subscribe_default_topics: {
           type: 'boolean',
@@ -221,85 +218,79 @@ export function buildHiAgentInstallTool(config: Required<HiOpenClawPluginConfig>
         display_name?: string;
         agent_kind?: string;
         host_session_key?: string;
-        replace_existing_state?: boolean;
         subscribe_default_topics?: boolean;
         metadata?: Record<string, unknown>;
       };
       try {
-        let state = await loadStateWithQuarantine(stateDir, config.profile, config.platformBaseUrl);
+        // Step 1: ensure a STABLE agent (register-once) — 绝不重注册。已有 identity → 复用；没有
+        // → 注册一次并 activate（openclaw 直连平台，read/search 需要已注册的 runtime agent_id）。
+        // 这是零 churn 的根：旧逻辑在 state 缺失 / OAuth 抖动 quarantine 时反复 register 新 agent，
+        // 每次都多一个孤儿。注册出来的 agent **未绑定身份**：读/搜索放行，写被平台 gate 挡到绑定为止。
+        // display_name 解析：caller 显式传 > workspace/IDENTITY.md 的 Name > 'OpenClaw Hi Agent'。
+        const workspaceDir = resolveOpenClawWorkspaceDir();
+        const identityName = readOpenClawIdentityName(workspaceDir);
+        const resolvedDisplayName = args.display_name?.trim() || identityName || 'OpenClaw Hi Agent';
+        const callerMetadata =
+          args.metadata && typeof args.metadata === 'object' && !Array.isArray(args.metadata) ? args.metadata : {};
+        let state = await ensureCredential({
+          stateDir,
+          profile: config.profile,
+          platformBaseUrl: config.platformBaseUrl,
+          displayName: resolvedDisplayName,
+          metadata: callerMetadata,
+        });
 
-        // Step 1: register if needed
-        let registerResp: any = null;
-        if (!state.identity || args.replace_existing_state) {
-          const pub = await buildPublicClients(config.platformBaseUrl);
-          // 调用方 metadata（典型来源：邀请落地页生成的 prompt 里 channel_code）先铺底，
-          // 然后强制覆盖 host/plugin/plugin_version 三个保留字段——既允许渠道归因这种
-          // 自定义 key 透传，又不让恶意调用方伪造 host=openclaw 之类的标记。
-          const callerMetadata =
-            args.metadata && typeof args.metadata === 'object' && !Array.isArray(args.metadata)
-              ? args.metadata
-              : {};
-          // display_name 解析优先级：caller 显式传 > workspace/IDENTITY.md 里 OpenClaw 自己填的
-          // Name > 'OpenClaw Hi Agent' 兜底。SOUL.md 协议保证活跃 OpenClaw 在 install 之前就读
-          // 过 IDENTITY.md，所以从这里读到的"Name:"通常是用户/LLM 已经认可的名字，比 system
-          // username 更准确，也比 hardcode "OpenClaw Hi Agent" 更可识别。
-          const workspaceDir = resolveOpenClawWorkspaceDir();
-          const identityName = readOpenClawIdentityName(workspaceDir);
-          const resolvedDisplayName =
-            args.display_name?.trim() || identityName || 'OpenClaw Hi Agent';
-          registerResp = await pub.gateway.register({
-            display_name: resolvedDisplayName,
-            agent_kind: args.agent_kind?.trim() || 'external',
-            capabilities: [],
-            metadata: {
-              ...callerMetadata,
-              host: 'openclaw',
-              plugin: 'hi-openclaw-plugin',
-              plugin_version: PLUGIN_VERSION,
-              // 把"display_name 是怎么解析出来的"如实记下来，admin/ops 排查"为什么这个 agent
-              // 还叫 OpenClaw Hi Agent / 跟 IDENTITY.md 不一致"时直接看 metadata 就明白了。
-              display_name_source: args.display_name?.trim()
-                ? 'caller'
-                : identityName
-                ? 'openclaw_identity_md'
-                : 'fallback_default',
-              ...(identityName ? { openclaw_identity_name: identityName } : {}),
-            },
-          });
-          const identity: HiIdentityState = {
-            agent_id: registerResp.agent.agent_id,
-            installation_id: registerResp.installation.installation_id,
-            display_name: registerResp.agent.display_name,
-            agent_kind: registerResp.agent.agent_kind,
-            client_id: registerResp.auth.client_id,
-            client_secret: registerResp.auth.client_secret,
-            installation_subject: registerResp.auth.installation_subject ?? registerResp.installation.installation_id,
-            issuer: registerResp.auth.issuer,
-            audience: registerResp.auth.audience,
-            token_url: registerResp.auth.token_url,
-            jwks_url: registerResp.auth.jwks_url,
-            activated_at: null,
-            delivery_capabilities: null,
-            plugin_version_synced: null,
-          };
-          state = await updateState(stateDir, config.profile, (cur) => ({
-            ...cur,
-            platform: { platform_base_url: config.platformBaseUrl, registry_base_url: config.platformBaseUrl, fetched_at: new Date().toISOString() },
-            identity,
-          }));
-        }
-
-        // Step 2: build authorized clients
+        // Step 2: build authorized clients（client_credentials 换 token）。
         const auth = await buildAuthorizedClients({ stateDir, profile: config.profile, platformBaseUrl: config.platformBaseUrl });
 
-        // Step 3: activate (idempotent)
+        // Step 3: 读回 remote canonical agent_id（ensureCredential 已 register+activate，这里应有值）。
+        let me: any = null;
+        try { me = await auth.gateway.me(); } catch { me = null; }
+        const registeredAgentId = String(me?.agent?.agent_id || state.identity?.agent_id || '').trim();
+
+        // 把 remote canonical 身份回写本地（agent_id/installation_id/activated_at）。
+        const installationResp = await auth.gateway.getInstallation().catch(() => null);
+        const remoteInstallationId = String(
+          (installationResp?.installation as any)?.installation_id
+          || (me?.installation as any)?.installation_id
+          || '',
+        ).trim();
+        const remoteActivatedAt = String(
+          (installationResp?.installation as any)?.activated_at
+          || (me?.installation as any)?.activated_at
+          || '',
+        ).trim() || null;
+        state = await updateState(stateDir, config.profile, (cur) => ({
+          ...cur,
+          identity: cur.identity
+            ? {
+                ...cur.identity,
+                agent_id: registeredAgentId,
+                installation_id: remoteInstallationId || cur.identity.installation_id,
+                installation_subject:
+                  remoteInstallationId || cur.identity.installation_subject || cur.identity.client_id,
+                display_name: String(me?.agent?.display_name || cur.identity.display_name),
+                agent_kind: String(me?.agent?.agent_kind || cur.identity.agent_kind),
+                activated_at: remoteActivatedAt || cur.identity.activated_at,
+                anonymous: false,
+              }
+            : cur.identity,
+        }));
+
+        // Step 3b: activate (idempotent)
         let activateResp: any = null;
         if (!state.identity?.activated_at) {
-          activateResp = await auth.gateway.activate({});
-          state = await updateState(stateDir, config.profile, (cur) => ({
-            ...cur,
-            identity: cur.identity ? { ...cur.identity, activated_at: activateResp.installation.activated_at ?? new Date().toISOString() } : cur.identity,
-          }));
+          try {
+            activateResp = await auth.gateway.activate({});
+            state = await updateState(stateDir, config.profile, (cur) => ({
+              ...cur,
+              identity: cur.identity
+                ? { ...cur.identity, activated_at: activateResp.installation?.activated_at ?? new Date().toISOString() }
+                : cur.identity,
+            }));
+          } catch {
+            // fail-soft：activate 失败不阻断 finalize（delivery/hooks 仍尝试，下次调用补激活）。
+          }
         }
 
         // Step 4: declare delivery capabilities + bind session
@@ -494,16 +485,41 @@ export function buildHiAgentInstallTool(config: Required<HiOpenClawPluginConfig>
 
         return asJsonResult({
           ok: !installationUpdateError && !hooksConfigureError,
+          mode: 'registered',
+          registered: true,
+          agent_id: registeredAgentId,
           profile: config.profile,
           state_dir: stateDir,
           quarantined_stale_identity: peekQuarantineNotice(),
-          register: registerResp,
           activate: activateResp,
           installation: installationUpdate,
           installation_update_error: installationUpdateError,
           subscriptions: subscriptionsResp,
           hooks_configure: hooksConfigure,
           hooks_configure_error: hooksConfigureError,
+          // 这台 OpenClaw 现在有一个稳定 agent，重启/开新窗口都是同一个，不会再新建。
+          // 读/搜索已可用；写操作（建档/发listing/联系人/约meeting）若还没绑定身份，会被平台
+          // 挡住（needs_binding / phone_binding_required）——届时默认用 Google（google_link），
+          // 也可手机（phone_binding）/邮箱（email_binding）。绑定挂到同一个 agent，不会新建。
+          write_requires_binding: {
+            recommended: 'google_link',
+            options: [
+              { tool: 'google_link', note: 'Sign in with Google（默认推荐）' },
+              { tool: 'phone_binding', note: '手机验证码：action:"bind" 发码 → action:"verify" 提交 SMS code' },
+              { tool: 'email_binding', note: '邮箱验证码（或邮箱里的 Google 登录）' },
+            ],
+            note: '绑定后这台机器仍是同一个 agent（绑定只是把身份挂上去，不新建 agent）。',
+          },
+          // "用新 agent 还是接回之前的 agent"的选择路径：若用户在别的设备上有想继续用的旧
+          // agent，可在旧设备 hi_agent_claim_export 导出凭单、这台 hi_agent_claim_redeem 接回，
+          // 即变回那个旧 agent（listings/会话/对端回复都在）。
+          previous_agent_choice: {
+            current_agent_id: registeredAgentId,
+            keep_current: '直接用这个 agent（默认）。',
+            switch_to_previous:
+              '如果你之前在别的设备上已经有一个想继续用的 Hi agent：在那台旧设备调 hi_agent_claim_export 拿一次性凭单，'
+              + '再在这台调 hi_agent_claim_redeem 输入凭单，这台就变回那个旧 agent。',
+          },
           summary: {
             agent_id: state.identity?.agent_id,
             installation_id: state.identity?.installation_id,
@@ -681,7 +697,7 @@ export function buildHiAgentResetTool(config: Required<HiOpenClawPluginConfig>):
     name: 'hi_agent_reset',
     label: 'Hi agent reset',
     description:
-      'Reset local Hi state: clears persisted identity + receiver runtime cursor. The Hi agent on the platform side is NOT destroyed; it just becomes orphan from this OpenClaw host. Run hi_agent_install afterward to register a fresh agent.',
+      'DESTRUCTIVE — avoid unless the user explicitly asks to wipe local Hi state. Clears the persisted local credential (the stable hi_ak_ key) + receiver cursor. The platform-side agent is NOT destroyed, but this host loses its link to it. After reset, this host falls back to anonymous read-only and the NEXT bind will re-converge to the same workspace by phone/email/Google — but if you only want to move this identity to another device, prefer hi_agent_claim_export (old device) + hi_agent_claim_redeem (new device) instead of reset, which keeps the SAME agent with zero churn. Do NOT call reset to "fix" a perceived problem; it is not a troubleshooting step (use hi_agent_status / hi_agent_doctor first).',
     parameters: {
       type: 'object',
       additionalProperties: false,
