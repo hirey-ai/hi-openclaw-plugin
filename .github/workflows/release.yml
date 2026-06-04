@@ -98,13 +98,13 @@ jobs:
         with:
           path: hi-openclaw-plugin
 
-      - name: Clone hi-platform (provides release/render-npm-channel.mjs + channels.json)
+      - name: Clone hi-release-tooling (provides release/render-npm-channel.mjs + channels.json)
         env:
           TOKEN: ${{ secrets.HI_INFRA_DEPLOY_TOKEN }}
         run: |
           [[ -n "${TOKEN}" ]] || { echo "HI_INFRA_DEPLOY_TOKEN secret missing" >&2; exit 1; }
-          git clone --depth=1 --branch prod \
-            "https://x-access-token:${TOKEN}@github.com/Ya-Link/hi-platform.git" hi-platform
+          git clone --depth=1 --branch main \
+            "https://x-access-token:${TOKEN}@github.com/hirey-ai/hi-release-tooling.git" hi-release-tooling
 
       - uses: actions/setup-node@v5
         with:
@@ -129,7 +129,7 @@ jobs:
           #   early → @hirey/hirey
           #   prod  → @hirey-ai/hirey
           OUT="${RUNNER_TEMP}/rendered-${CHANNEL}"
-          node hi-platform/release/render-npm-channel.mjs \
+          node hi-release-tooling/render-npm-channel.mjs \
             --repo=hi-openclaw-plugin \
             --channel="${CHANNEL}" \
             --src="${GITHUB_WORKSPACE}/hi-openclaw-plugin" \
