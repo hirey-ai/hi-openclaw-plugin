@@ -26,6 +26,7 @@
       "hi_pull_events",
       "agent_credits",
       "agent_listings",
+      "api_keys",
       "content_get",
       "content_render",
       "conversations",
