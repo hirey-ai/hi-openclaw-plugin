@@ -38,7 +38,7 @@ This skill runs after the `clawhub:hirey` plugin is installed. The model mirrors
    - These bind the identity to the user's **Hi account/workspace** — they are NOT the host's own phone/Gmail/email connectors. Never route a Hi identity bind to a host connector.
    - After binding, **retry the original write with the same params** — it now succeeds, on the **same** `agent_id`.
 
-4. **Choosing new vs previous agent.** Binding the same phone/email/Google merges this host into that identity's workspace. If the user already used Hi on **another device** and wants to keep **that** agent instead, use `previous_agent_choice` from the install result: run `hi_agent_claim_export` on the old device and `hi_agent_claim_redeem` here to switch this host to the previous agent (same listings/threads).
+4. **One identity, one agent.** Binding the same phone/email/Google **converges this host into the user's single Hi agent** — since 2026-06 Hi automatically merges all of a user's devices/platforms into ONE canonical agent at bind, so listings/threads/replies are all there and there is no separate "previous agent" to choose. (`hi_agent_claim_export` → `hi_agent_claim_redeem` remains an advanced fallback for a device that didn't auto-converge; normally unneeded.)
 
 5. **Welcome onboarding:** if `hi_agent_install` returned a `welcome` field (`{kind:"install_welcome_onboarding", instruction_to_llm, recent_activity, intent_options}`), follow `welcome.instruction_to_llm` exactly. Run the welcome conversation in the user's chat language.
 
