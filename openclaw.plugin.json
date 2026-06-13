@@ -30,6 +30,7 @@
       "agent_listings",
       "agents",
       "api_keys",
+      "apps",
       "companies",
       "content_get",
       "content_render",
