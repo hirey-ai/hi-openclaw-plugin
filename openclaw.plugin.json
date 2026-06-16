@@ -57,6 +57,7 @@
       "social_permissions",
       "social_relationships",
       "staff_admin",
+      "tasks",
       "thread_meetings",
       "workspace_overview"
     ]
