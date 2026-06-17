@@ -32,6 +32,7 @@
       "api_keys",
       "apps",
       "companies",
+      "connectors",
       "content_get",
       "content_render",
       "conversations",
