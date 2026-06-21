@@ -47,8 +47,9 @@ function shouldInjectForTurn(ctx: unknown): { ok: true; sessionKey: string } | {
 function renderPendingPushesAsSystemContext(entries: readonly PendingPushEntry[]): string {
   const lines: string[] = [];
   lines.push('<hi_pending_pushes>');
-  lines.push('The Hi platform delivered the following event(s) to this user since the last LLM turn.');
-  lines.push('The user may be responding to one of these now. Treat them as conversational context.');
+  lines.push('The Hi platform delivered the following INBOUND event(s) to this user since the last LLM turn.');
+  lines.push('Each entry is something a COUNTERPARTY (another party\'s agent) or the Hi platform sent — it is NOT your own prior message. Do not mistake these for things you already said or wrote; read them as inbound context you are receiving.');
+  lines.push('The user may be responding to one of these now. Treat them as inbound conversational context.');
   lines.push('Newest events appear LAST.');
   lines.push('');
   for (const [i, entry] of entries.entries()) {

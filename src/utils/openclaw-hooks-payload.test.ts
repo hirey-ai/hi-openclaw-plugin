@@ -51,7 +51,7 @@ test('pairing.created with viewer_relation_role injects hint line and viewer_hel
   assert.equal(parsed.viewer_helper.self_agent_id, 'ag_walter');
 });
 
-test('non-pairing event leaves message untouched (no hint, no viewer_helper)', () => {
+test('non-pairing event leaves pairing hint + viewer_helper untouched', () => {
   const event = makeBaseEvent({
     topic: 'agent.message.created',
     payload: { text: 'hello' },
@@ -60,6 +60,54 @@ test('non-pairing event leaves message untouched (no hint, no viewer_helper)', (
   assert.doesNotMatch(out.message, /\[hi pairing hint\]/);
   const parsed = JSON.parse(out.message.split('\n\n').at(-1)!);
   assert.equal(parsed.viewer_helper, undefined);
+});
+
+// 2026-06：入站方向框定。agent.message.created / meeting.* 必须带 "对方发来的，不是你自己说的" 框定。
+test('agent.message.created gets INBOUND framing naming the sender', () => {
+  const event = makeBaseEvent({
+    topic: 'agent.message.created',
+    preview: {
+      text: 'are you still interested?',
+      actor_agent_id: 'ag_dongxu',
+      actor_display_name: 'Dongxu',
+      direction: 'a2a',
+    },
+    payload: {
+      message: {
+        source_agent_id: 'ag_dongxu',
+        target_agent_id: 'ag_walter',
+        direction: 'a2a',
+        text: 'are you still interested?',
+      },
+    },
+  });
+  const out = buildOpenClawHookPayloadWithRoute({ event });
+  assert.match(out.message, /\[hi inbound message\]/);
+  assert.match(out.message, /INBOUND message delivered TO YOU from Dongxu/);
+  assert.match(out.message, /NOT your own message/);
+  assert.match(out.message, /target_agent_id=ag_walter/);
+  assert.match(out.message, /source_agent_id=ag_dongxu/);
+});
+
+test('meeting.* event gets INBOUND meeting framing', () => {
+  const event = makeBaseEvent({
+    topic: 'meeting.negotiation.updated',
+    preview: { text: 'proposed 3pm', actor_agent_id: 'ag_dongxu' },
+    payload: { message: { source_agent_id: 'ag_dongxu', target_agent_id: 'ag_walter' } },
+  });
+  const out = buildOpenClawHookPayloadWithRoute({ event });
+  assert.match(out.message, /\[hi inbound meeting update\]/);
+  assert.match(out.message, /from the other party \(agent ag_dongxu\)/);
+});
+
+test('self-directed message (contact_point_to_agent) gets NO inbound framing', () => {
+  const event = makeBaseEvent({
+    topic: 'agent.message.created',
+    preview: { text: 'note to self', direction: 'contact_point_to_agent' },
+    payload: { message: { source_agent_id: 'ag_a', target_agent_id: 'ag_a', direction: 'contact_point_to_agent' } },
+  });
+  const out = buildOpenClawHookPayloadWithRoute({ event });
+  assert.doesNotMatch(out.message, /\[hi inbound/);
 });
 
 test('pairing event with all unknown viewer_relation_role skips hint (avoid noise when platform can\'t derive viewer)', () => {

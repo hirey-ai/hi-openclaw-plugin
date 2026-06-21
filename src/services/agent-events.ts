@@ -150,8 +150,12 @@ async function deliverEventToHooks(args: {
   //     字段直接 channel-send 给用户（Walter 在 Telegram 看到 push 这一步 UX 不变）。
   //
   // 当 hook 未激活（老 OpenClaw / HI_PUSH_INJECTION=off）：
-  //   - 完全保留 1.0.30 旧行为：携带 sessionKey 投递。这条路径有 rotation bug 但
-  //     至少跟 prod 当前行为一致，不会比 1.0.30 更差（回滚到现状）。
+  //   - 不再写 pending-pushes（没有 before_prompt_build 去读它），LLM 这一轮拿不到 push
+  //     context——退化到 channel-send-only（用户仍在 channel 看到 push，只是 LLM 主会话
+  //     不带上下文）。
+  //   - **但 sessionKey 仍然无条件 strip**（见下方）。旧版本只在注入激活时 strip，未激活时
+  //     携带 sessionKey 投递 → /hooks/agent rotate 用户会话 → "最后更新刷没了"。该旧路径
+  //     已知有害，现已彻底退役：缺 LLM context 可以接受，刷掉用户 transcript 不可接受。
   if (isPushInjectionActive()) {
     // pending-pushes 目标 sessionKey 的解析比 /hooks/agent payload 的 sessionKey 更激进：
     //   - 优先 body.sessionKey（来自 reply_route_snapshot.session_key 或上面的 payloadConfig fallback）
@@ -209,10 +213,19 @@ async function deliverEventToHooks(args: {
         kind: args.event?.payload?.kind,
       });
     }
-    // STRIP sessionKey 防 /hooks/agent rotate 用户 session
-    if (body.sessionKey) {
-      delete (body as any).sessionKey;
-    }
+  }
+
+  // ---- 无条件 STRIP sessionKey（修 "定期刷新把最后更新刷没了"）----
+  // /hooks/agent 永远是 sessionTarget="isolated" + forceNew=true：把用户真实 sessionKey 传进去
+  // 会 rotate 它的 sessionFile 指针、抹掉用户可见 transcript。这一步必须**无条件**执行——
+  // 不能再像旧版那样只在 isPushInjectionActive() 时才 strip。当注入未激活时
+  // （HI_PUSH_INJECTION=off / 老 host 无 api.on / api.on 注册抛错被吞），旧路径会携带
+  // 用户真实 sessionKey 投递，于是每条 push + 每次 SSE 重连 drainBacklog 重投都把用户主会话
+  // 刷掉一次（分钟级周期）——这正是用户感知的 "定期刷新把最后更新刷没了" 的根因。
+  // channel/to/agentId 已足够让 OpenClaw 在 isolated session 里跑 LLM 并 channel-send 给用户；
+  // 用户主会话的 transcript 永远不该被这条隔离投递触碰。
+  if (body.sessionKey) {
+    delete (body as any).sessionKey;
   }
 
   const response = await fetch(args.hooksUrl, {

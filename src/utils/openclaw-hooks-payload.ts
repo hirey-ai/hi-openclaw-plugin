@@ -114,12 +114,64 @@ function buildPairingViewerHint(event: AgentGatewayEventSnapshot): {
   return { hint, helper };
 }
 
+// 2026-06：入站消息/会议事件的"这是对方说的，不是你自己说的"框定。
+//
+// agent.message.created 与 meeting.* 事件**永远**投递给 target_agent_id（接收方=本机 agent），
+// body 永远是 source_agent_id 写的。但旧渲染只把 preview.text + 一坨原始 JSON 丢给 LLM，
+// 没有任何方向框定——于是 LLM 把"对方发来的入站消息"和"自己上一轮的输出"混在同一条
+// transcript 里，分不清谁说的（Walter 反馈的"经常分不清是对方发来的消息还是自己的消息"）。
+// buildPairingViewerHint 只覆盖 pairing.created/updated（首次配对），后续来回对话的
+// agent.message.created 一直没有任何框定。这里给所有入站会话事件补一条明确的入站祈使句。
+//
+// 自我定向消息（agent_to_contact_point / contact_point_to_agent，即 agent 跟自己 owner 的
+// contact point 对话）不是"对方入站"，跳过框定避免误导。
+const SELF_DIRECTED_DIRECTIONS = new Set<string>([
+  'agent_to_contact_point',
+  'contact_point_to_agent',
+]);
+
+function buildInboundMessageHint(event: AgentGatewayEventSnapshot): string | null {
+  const topic = String((event as any)?.topic || '');
+  const isMessage = topic === 'agent.message.created';
+  const isMeeting = topic.startsWith('meeting.');
+  if (!isMessage && !isMeeting) return null;
+
+  const preview = ((event as any)?.preview && typeof (event as any).preview === 'object')
+    ? (event as any).preview as Record<string, any>
+    : {};
+  const msg = ((event as any)?.payload?.message && typeof (event as any).payload.message === 'object')
+    ? (event as any).payload.message as Record<string, any>
+    : {};
+
+  const direction = normalizeText(preview.direction || msg.direction);
+  if (SELF_DIRECTED_DIRECTIONS.has(direction)) return null;
+
+  const senderName = normalizeText(preview.actor_display_name || msg.source_display_name);
+  const senderAgentId = normalizeText(preview.actor_agent_id || msg.source_agent_id);
+  const recipientAgentId = normalizeText(msg.target_agent_id);
+  const senderLabel = senderName
+    ? `${senderName}${senderAgentId ? ` (agent ${senderAgentId})` : ''}`
+    : (senderAgentId ? `the other party (agent ${senderAgentId})` : 'the other party');
+  const kind = isMeeting ? 'meeting update' : 'message';
+
+  return [
+    `[hi inbound ${kind}] The following is an INBOUND ${kind} delivered TO YOU from ${senderLabel}.`,
+    'It is NOT your own message — do not treat it as something you already wrote or said. Read it as what the OTHER PARTY just sent you, and decide how YOU should respond.',
+    recipientAgentId
+      ? `You are the recipient (target_agent_id=${recipientAgentId}); the sender is source_agent_id=${senderAgentId || 'unknown'}.`
+      : '',
+  ].filter(Boolean).join('\n');
+}
+
 function buildOpenClawContinuationMessage(
   event: AgentGatewayEventSnapshot,
   messagePrefix: string | null,
 ): string {
   const parts: string[] = [];
   if (messagePrefix) parts.push(messagePrefix);
+  // 入站框定排在最前（pairing hint 之前）：先让 LLM 确立"这是对方发来的"，再谈"对方是谁"。
+  const inboundHint = buildInboundMessageHint(event);
+  if (inboundHint) parts.push(inboundHint);
   const viewerHint = buildPairingViewerHint(event);
   if (viewerHint) parts.push(viewerHint.hint);
   if ((event as any)?.preview?.text) parts.push(String((event as any).preview.text));
