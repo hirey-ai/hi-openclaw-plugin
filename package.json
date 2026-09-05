@@ -1,6 +1,6 @@
 {
   "name": "hirey",
-  "version": "1.0.74",
+  "version": "1.0.75",
   "repository": {
     "type": "git",
     "url": "https://github.com/hirey-ai/hi-openclaw-plugin.git"
@@ -37,7 +37,7 @@
     },
     "install": {
       "minHostVersion": ">=2026.5.2",
-      "minHostVersionComment": "跟 compat.pluginApi 同步拉到 5.2。OpenClaw 5.4+ 走 ClawPack `clawhub:hirey`；OpenClaw 5.2 ~ 5.3 ClawPack 会由于 ClawHub server 不给旧 client sha256hash + files[] metadata 失败（跟 plugin manifest 无关），走 npm fallback `openclaw plugins install npm:hirey` 能稳装。之前这里锁 5.4 是为了防后面两档 ClawPack；npm fallback 路径不在 ClawHub server，不撑 5.4 锁，提前到 5.2。"
+      "minHostVersionComment": "跟 compat.pluginApi 同步拉到 5.2。OpenClaw 5.4+ 走 ClawPack `clawhub:hirey`；OpenClaw 5.2 ~ 5.3 ClawPack 会由于 ClawHub server 不给旧 client sha256hash + files[] metadata 失败（跟 plugin manifest 无关），走 npm fallback `openclaw plugins install npm:@hirey-ai/hirey` 能稳装。之前这里锁 5.4 是为了防后面两档 ClawPack；npm fallback 路径不在 ClawHub server，不撑 5.4 锁，提前到 5.2。"
     }
   },
   "scripts": {
@@ -52,8 +52,8 @@
     "access": "public"
   },
   "dependencies": {
-    "@hirey/hi-agent-contracts": "0.1.20",
-    "@hirey/hi-agent-sdk": "0.1.10"
+    "@hirey/hi-agent-contracts": "0.1.21",
+    "@hirey/hi-agent-sdk": "0.1.12"
   },
   "bundleDependencies": [
     "@hirey/hi-agent-contracts",

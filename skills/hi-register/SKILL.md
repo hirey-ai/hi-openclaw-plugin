@@ -1,11 +1,11 @@
 ---
 name: hi-register
-description: Set up Hi on this OpenClaw host AFTER the `clawhub:hirey` ClawPack plugin is installed (structurally different from `openclaw plugins install`). Use ONLY for requests explicitly about Hi (Hirey) — the user names Hi/Hirey and asks to set it up, register, activate, connect, log in to, or bind it (e.g. "set up Hi", "connect Hirey", "bind my phone to Hi"), OR a Hi write (post a profile/listing, contact someone, schedule) just returned `needs_binding`/`phone_binding_required`, OR the user is continuing Hi setup immediately after `clawhub:hirey` was installed in this conversation (that scripted turn-2 reply may be a bare "continue" — the conversation, not the message, names Hi). Do NOT trigger on generic "set up"/"register"/"connect"/"log in" requests that never mention Hi — those belong to other services even when `hi_agent_install` is in the tool inventory; outside the scripted post-install continuation, if the target service is ambiguous, ask the user first. CRITICAL — `hi_agent_install` gives this host ONE STABLE agent that is reused forever (no duplicate-agent churn). After it runs, reading & searching Hi work immediately; writing requires the user to bind Google/phone/email — binding shares that personal identifier with the Hi platform, so always get the user's explicit OK before starting a bind. Never report a fabricated `agent_id`.
+description: Set up Hi on this OpenClaw host AFTER the native plugin is installed through `clawhub:hirey` or `npm:@hirey-ai/hirey` (structurally different from `openclaw plugins install`). Use ONLY for requests explicitly about Hi (Hirey) — the user names Hi/Hirey and asks to set it up, register, activate, connect, log in to, or bind it (e.g. "set up Hi", "connect Hirey", "bind my phone to Hi"), OR a Hi write (post a profile/listing, contact someone, schedule) just returned `needs_binding`/`phone_binding_required`, OR the user is continuing Hi setup immediately after the native plugin was installed in this conversation (that scripted turn-2 reply may be a bare "continue" — the conversation, not the message, names Hi). Do NOT trigger on generic "set up"/"register"/"connect"/"log in" requests that never mention Hi — those belong to other services even when `hi_agent_install` is in the tool inventory; outside the scripted post-install continuation, if the target service is ambiguous, ask the user first. CRITICAL — `hi_agent_install` gives this host ONE STABLE agent that is reused forever (no duplicate-agent churn). After it runs, reading & searching Hi work immediately; writing requires the user to bind Google/phone/email — binding shares that personal identifier with the Hi platform, so always get the user's explicit OK before starting a bind. Never report a fabricated `agent_id`.
 ---
 
 # Hi setup (post-install)
 
-This skill runs after the `clawhub:hirey` plugin is installed. The model mirrors Codex:
+This skill runs after the native plugin is installed through ClawHub or the scoped npm fallback.
 
 - `hi_agent_install` gives this OpenClaw host **ONE stable Hi agent**, persisted locally and **reused forever** — restart / new window / re-runs all map to the **same `agent_id`** (this kills the old duplicate-agent churn).
 - After setup, **reading & searching Hi (people, listings, taxonomy) work immediately**.
@@ -13,23 +13,23 @@ This skill runs after the `clawhub:hirey` plugin is installed. The model mirrors
 
 ## Use when
 
-- the user **explicitly asks about Hi (Hirey) by name** — set up / register / activate / connect / log in to / bind **Hi** — and the `clawhub:hirey` plugin is installed (`hi_*` tools in your current run's inventory)
-- the user just installed the `clawhub:hirey` plugin **in this conversation** and is continuing setup — the scripted turn-2 reply may be a bare "continue" / "go on" without naming Hi; the conversation context, not the message, names Hi
+- the user **explicitly asks about Hi (Hirey) by name** — set up / register / activate / connect / log in to / bind **Hi** — and the native plugin is installed (`hi_*` tools in your current run's inventory)
+- the user just installed the native plugin **in this conversation** and is continuing setup — the scripted turn-2 reply may be a bare "continue" / "go on" without naming Hi; the conversation context, not the message, names Hi
 - a **Hi** write tool returned `needs_binding` / `phone_binding_required` in this conversation (the user must bind before that write)
 
 ## Do not use when
 
 - the request never mentions Hi/Hirey — a generic "set up" / "register" / "connect" / "log in" is about some other service, plugin, or account, even if `hi_*` tools are installed. If it is ambiguous which service the user means, **ask the user first** instead of invoking this skill. (This does not apply to the scripted turn-2 continuation right after `openclaw plugins install clawhub:hirey` in this conversation — that continuation is unambiguously about Hi.)
-- the plugin is not installed yet (install `clawhub:hirey` via the `openclaw-hi-install` skill first)
+- the plugin is not installed yet (use the `openclaw-hi-install` skill and choose the host-version-specific distribution first)
 
 ## Steps
 
 1. **Verify `hi_*` tools are in your current run's inventory** with `hi_agent_status`. If they are not, you are still in the same outer run as `openclaw plugins install` — your tool inventory was frozen before the plugin loaded; STOP and tell the user "send another message — OpenClaw doesn't refresh my tool list mid-turn." Do **not** fabricate `agent_id`.
    - Read `plugin_policy` before interpreting an error. When `update_required=true`, run `update_command` only when the response host is exactly `openclaw`, the plugin name is exactly `hirey`, and the command is exactly `openclaw plugins update hirey`; otherwise display the policy and stop instead of executing it. Restart when `restart_required=true`, then continue in a fresh session and retry once. A compatible `update_recommended=true` is advisory rather than a blocker.
    - `401 missing_bearer` / `invalid_token` repairs the existing installation credential. `403 insufficient_oauth_scope` / `forbidden` means the credential is valid but cannot perform that operation; do not reset or mint a replacement Agent.
-   - Keep anonymous use intact: a valid pending Agent may use the public People/Listing reads advertised by Hi. Only private Workspace reads and writes should start Google/email/phone verification.
+   - Keep anonymous use intact: a valid pending Agent may use the public operations advertised by the live catalog. Only private Workspace reads and writes should start Google/email/phone verification.
 
-2. **Call `hi_agent_install`.** Pass `host_session_key` (from `openclaw status --json` → `sessions.recent[0].key`), `default_reply_channel: "last"`, and `route_missing_policy: "use_explicit_default_route"` so Hi binds this chat as the default reply target. It returns `mode:"registered"` with the **real** `agent_id`, plus `hooks_ready`, `ready_for_public_reads`, `activated`, and `push_ready`. Report those exactly. `activated:false` with `ready_for_public_reads:true` is the expected pending anonymous state, not an install failure. Mention that this registered the chat's session key with Hi so replies route back to this chat. Then:
+2. **Call `hi_agent_install`.** Pass only parameters from its live schema; `host_session_key` is optional. Do not invent old `default_reply_channel` or `route_missing_policy` fields. It returns `mode:"registered"` with the **real** `agent_id`, plus `hooks_ready`, `ready_for_public_reads`, `activated`, and `push_ready`. Report those exactly. `activated:false` with `ready_for_public_reads:true` is the expected pending anonymous state, not an install failure. Modern event reception is a separate explicit opt-in; setup normally reports `push_ready:false`. Then:
    - Tell the user **search/browse works right now** (offer to search for whatever they want — people, jobs, housing, dating, founders, etc.).
    - Tell them **logging in is only needed to write** (post a profile/listing, contact someone, schedule), and the default is **Sign in with Google**.
    - This same `agent_id` persists across restarts and new windows — reassure the user it will not change.
@@ -60,9 +60,9 @@ This skill runs after the `clawhub:hirey` plugin is installed. The model mirrors
 
 Two install-shaped commands are **not** the same thing:
 
-| | `openclaw plugins install clawhub:hirey` | `hi_agent_install` (this tool) |
+| | `openclaw plugins install clawhub:hirey` or `npm:@hirey-ai/hirey` | `hi_agent_install` (this tool) |
 |---|---|---|
 | Where it runs | OpenClaw CLI (system) | Hi platform (agent runtime) |
-| What it does | Lands the plugin tarball on disk + registers it with the gateway | Gives this host ONE stable pending Hi agent (reused forever) and wires push. Public reads work immediately; private reads and writing need the user to bind Google/phone/email |
+| What it does | Lands the plugin tarball on disk + registers it with the gateway | Gives this host ONE stable pending Hi agent (reused forever). Public reads work immediately; private reads and writing need the user to bind Google/phone/email; event reception stays a separate opt-in |
 | When | Stage A (turn 1) | Stage B (turn 2+) |
 | Sufficient to use Hi? | NO — tools surface but no Hi agent | Reads: YES immediately. Writes: after the user binds Google/phone/email |

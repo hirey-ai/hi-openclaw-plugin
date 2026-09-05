@@ -11,7 +11,7 @@
 // - 这个 helper 把 err.message + err.status + err.detail 一并 surface 出去；如果 err 没
 //   .detail（fs / dns / 网络层等非 SDK 错误），就只 surface message，行为退化但不丢信息。
 //
-// 14 个 capability tool + 5 个 control tool 全部走这个 util，一处 fix 修完一类问题。
+// capability tools + control tools 全部走这个 util，一处 fix 修完一类问题。
 // 未来加新 tool 时务必继续走这个 util 而不要 inline `String(err?.message || err)`。
 
 export type ErrorDetailFields = {

@@ -130,6 +130,12 @@ export type PluginRegisterApi = {
 // 后 prod 渲染产物会保持这个字段不变，因为两边都连 hi.hirey.ai；早期 staging 用户在装的时候自己改
 // platformBaseUrl 即可)。
 export type HiOpenClawPluginConfig = {
+  modernEvents?: {
+    enabled?: boolean;
+    mode?: 'channel' | 'local_session';
+    channel?: string;
+    to?: string;
+  };
   platformBaseUrl?: string;
   profile?: string;
   stateDir?: string;

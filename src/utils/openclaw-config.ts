@@ -9,11 +9,14 @@
 //   - phase1 hooks write (line 661–690)
 
 import fs from 'node:fs/promises';
-import os from 'node:os';
 import path from 'node:path';
 import crypto from 'node:crypto';
+import { resolveOpenClawStateRoot } from '../state.js';
 
-export const OPENCLAW_CONFIG_PATH = path.join(os.homedir(), '.openclaw', 'openclaw.json');
+export function resolveOpenClawConfigPath(env: NodeJS.ProcessEnv = process.env): string {
+  const configured = String(env.OPENCLAW_CONFIG_PATH || '').trim();
+  return configured ? path.resolve(configured) : path.join(resolveOpenClawStateRoot(env), 'openclaw.json');
+}
 
 const DEFAULT_HOOKS_PATH = '/hooks';
 const DEFAULT_ACTIVE_AGENT_PREFIX = 'agent:active:';
@@ -98,20 +101,26 @@ function hooksConfigSatisfies(
   return true;
 }
 
-async function readOpenClawConfig(): Promise<{ root: Record<string, unknown>; hooks: OpenClawHooksConfigShape | null }> {
+async function readOpenClawConfig(): Promise<{
+  root: Record<string, unknown>;
+  hooks: OpenClawHooksConfigShape | null;
+  configPath: string;
+}> {
+  const configPath = resolveOpenClawConfigPath();
   try {
-    const raw = await fs.readFile(OPENCLAW_CONFIG_PATH, 'utf8');
+    const raw = await fs.readFile(configPath, 'utf8');
     const parsed = JSON.parse(raw);
     if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
-      return { root: {}, hooks: null };
+      return { root: {}, hooks: null, configPath };
     }
     const hooks = (parsed as any).hooks;
     return {
       root: parsed as Record<string, unknown>,
       hooks: hooks && typeof hooks === 'object' && !Array.isArray(hooks) ? (hooks as OpenClawHooksConfigShape) : null,
+      configPath,
     };
   } catch (err: any) {
-    if (err?.code === 'ENOENT') return { root: {}, hooks: null };
+    if (err?.code === 'ENOENT') return { root: {}, hooks: null, configPath };
     throw err;
   }
 }
@@ -119,8 +128,14 @@ async function readOpenClawConfig(): Promise<{ root: Record<string, unknown>; ho
 async function atomicWriteJson(file: string, value: unknown): Promise<void> {
   const tmp = `${file}.tmp-${process.pid}-${Date.now()}`;
   await fs.mkdir(path.dirname(file), { recursive: true });
-  await fs.writeFile(tmp, `${JSON.stringify(value, null, 2)}\n`, 'utf8');
+  await fs.writeFile(tmp, `${JSON.stringify(value, null, 2)}\n`, {
+    encoding: 'utf8',
+    mode: 0o600,
+  });
   await fs.rename(tmp, file);
+  // rename preserves the temporary file's mode. chmod again to repair an
+  // existing config that an older plugin rewrite may have left too broad.
+  await fs.chmod(file, 0o600);
 }
 
 // 主入口：保证 OpenClaw 的 hooks 段满足 native plugin daemon POST hooks/agent 的最小需求。
@@ -136,7 +151,7 @@ export async function ensureOpenClawHooksConfigured(args: {
   const hooksPath = normalizeHooksPath(args.hooksPath || DEFAULT_HOOKS_PATH);
   const activeAgentPrefix = (args.activeAgentPrefix || DEFAULT_ACTIVE_AGENT_PREFIX).trim() || DEFAULT_ACTIVE_AGENT_PREFIX;
 
-  const { root, hooks: currentHooks } = await readOpenClawConfig();
+  const { root, hooks: currentHooks, configPath } = await readOpenClawConfig();
   const reuseToken =
     (typeof args.preferredToken === 'string' && args.preferredToken.trim()) ||
     (typeof currentHooks?.token === 'string' && currentHooks.token.trim()) ||
@@ -147,18 +162,18 @@ export async function ensureOpenClawHooksConfigured(args: {
     return {
       hooks_token: reuseToken,
       hooks_path: desired.path!,
-      hooks_file: OPENCLAW_CONFIG_PATH,
+      hooks_file: configPath,
       changed: false,
       previous_hooks: currentHooks,
       next_hooks: desired,
     };
   }
   const nextRoot = { ...root, hooks: desired };
-  await atomicWriteJson(OPENCLAW_CONFIG_PATH, nextRoot);
+  await atomicWriteJson(configPath, nextRoot);
   return {
     hooks_token: reuseToken,
     hooks_path: desired.path!,
-    hooks_file: OPENCLAW_CONFIG_PATH,
+    hooks_file: configPath,
     changed: true,
     previous_hooks: currentHooks,
     next_hooks: desired,
@@ -177,7 +192,7 @@ export async function ensurePluginToolsAlsoAllowed(): Promise<{
   also_allow_before: string[];
   also_allow_after: string[];
 }> {
-  const { root } = await readOpenClawConfig();
+  const { root, configPath } = await readOpenClawConfig();
   const tools = ((root as any).tools && typeof (root as any).tools === 'object' && !Array.isArray((root as any).tools))
     ? { ...((root as any).tools as Record<string, unknown>) }
     : {};
@@ -191,7 +206,7 @@ export async function ensurePluginToolsAlsoAllowed(): Promise<{
   const nextAlsoAllow = [...currentAlsoAllow, wantToken];
   (tools as any).alsoAllow = nextAlsoAllow;
   const nextRoot = { ...root, tools };
-  await atomicWriteJson(OPENCLAW_CONFIG_PATH, nextRoot);
+  await atomicWriteJson(configPath, nextRoot);
   return { changed: true, also_allow_before: currentAlsoAllow, also_allow_after: nextAlsoAllow };
 }
 
@@ -214,7 +229,7 @@ export async function readGatewayPort(): Promise<number> {
 // OpenClaw 默认 agent id 是 main；多 agent 户可扩 plugin config，此处暂写死。
 import fsSync from 'node:fs';
 export function findRecentUserSessionKey(): string | null {
-  const sessionsFile = path.join(os.homedir(), '.openclaw', 'agents', 'main', 'sessions', 'sessions.json');
+  const sessionsFile = path.join(resolveOpenClawStateRoot(), 'agents', 'main', 'sessions', 'sessions.json');
   try {
     const raw = fsSync.readFileSync(sessionsFile, 'utf8');
     const parsed = JSON.parse(raw) as unknown;

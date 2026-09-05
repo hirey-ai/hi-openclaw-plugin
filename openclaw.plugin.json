@@ -24,57 +24,45 @@
       "hi_agent_claim_export",
       "hi_agent_claim_redeem",
       "hi_pull_events",
-      "account_managers",
-      "act_as",
-      "agent_credits",
-      "agent_listings",
-      "agents",
-      "api_keys",
-      "apps",
-      "companies",
-      "connector_archive",
-      "connectors",
-      "content_get",
-      "content_render",
-      "conversations",
       "email_binding",
-      "event_groups",
-      "faq_get",
-      "faq_search",
       "google_link",
-      "interview_uploads",
-      "listing_taxonomy",
-      "managed_accounts",
-      "matching_sessions",
-      "meeting_rules",
-      "merge_agents",
-      "owner_articles",
-      "owner_documents",
-      "owner_images",
-      "owner_intro_videos",
-      "owner_videos",
-      "owners",
-      "pairings",
       "phone_binding",
-      "private_handoffs",
-      "private_video_workbench",
-      "product_signals",
-      "public_pages",
-      "repair_cases",
-      "sms_notifications",
-      "social_org",
-      "social_permissions",
-      "social_relationships",
-      "staff_admin",
-      "tasks",
-      "thread_meetings",
-      "workspace_overview"
+      "workspace_workflows"
     ]
   },
   "configSchema": {
     "type": "object",
     "additionalProperties": false,
     "properties": {
+      "modernEvents": {
+        "type": "object",
+        "additionalProperties": false,
+        "default": {},
+        "description": "Opt-in modern Gateway event receiver. Requires existing local hooks configuration and an explicitly selected destination; never enabled by installation or upgrade.",
+        "properties": {
+          "enabled": {
+            "type": "boolean",
+            "default": false
+          },
+          "mode": {
+            "type": "string",
+            "enum": [
+              "channel",
+              "local_session"
+            ],
+            "default": "channel",
+            "description": "channel delivers through an installed external channel; local_session creates a Web-visible isolated session with external delivery disabled."
+          },
+          "channel": {
+            "type": "string",
+            "description": "Explicit installed outbound channel for channel mode. WebChat is not an outbound channel."
+          },
+          "to": {
+            "type": "string",
+            "description": "Explicit recipient on that channel; event payloads cannot override it."
+          }
+        }
+      },
       "platformBaseUrl": {
         "type": "string",
         "description": "Hirey Hi platform base URL. Defaults to the Hirey AI public service.",

@@ -5,7 +5,7 @@
 // schema 来源（1.0.20 起）：build-time snapshot。
 //
 // scripts/snapshot-capabilities.mjs 在 npm publish / npm pack / clawhub publish 之前会
-// 一次性 fetch prod https://hi.hirey.ai/v1/capabilities，把 14 个（未来 N 个）
+// 一次性 fetch prod https://hi.hirey.ai/v1/capabilities，把当前全量
 // PublicAgentCapability 的完整 input schema 写到 dist/capabilities.snapshot.json。
 // register 阶段同步 readFileSync 加载这份 snapshot，原样作为 OpenClaw registerTool 的
 // parameters。这样：
@@ -21,7 +21,7 @@
 //     listing_id 之类参数静默丢掉，让平台收到空 args 后回 "unsupported action"
 //
 // 历史：
-//   1.0.0 ~ 1.0.15：hardcoded 14 个 CapabilitySpec + bare additionalProperties:true schema。
+//   1.0.0 ~ 1.0.15：hardcoded 旧 CapabilitySpec + bare additionalProperties:true schema。
 //     OpenAI strict mode 把 properties 静默剥光，调用方传 action 字段被丢，平台 422
 //     unsupported action（线上 repro：listing_taxonomy(action="list_types") /
 //     agent_listings(action="upsert"))。
@@ -38,7 +38,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import url from 'node:url';
 import type { PluginToolDefinition, PluginToolResult, HiOpenClawPluginConfig, PluginToolContext } from '../types.js';
-import { buildAuthorizedClients } from '../clients.js';
+import { buildAuthorizedClients, invalidateAuthorizedClients } from '../clients.js';
 import { resolveStateDir } from '../state.js';
 import { buildErrorDetailFields } from '../utils/error-detail.js';
 import type { PublicAgentCapability } from '@hirey/hi-agent-sdk';
@@ -190,8 +190,14 @@ function buildCapabilityTool(
           spec.capability_id,
           enrichedParams,
         );
+        const binding = result as any;
+        if (['google_link','email_binding','phone_binding'].includes(spec.tool_name)
+          && [binding?.status, binding?.data?.status, binding?.result?.status].includes('verified')) {
+          invalidateAuthorizedClients(stateDir, config.profile);
+        }
         return asJsonResult({ ok: true, ...(result as Record<string, unknown>), capability_id: spec.capability_id });
       } catch (err: any) {
+        if (err?.status === 401) invalidateAuthorizedClients(stateDir, config.profile);
         // 写操作 gate：匿名调用写类 capability 命中平台 phone_binding_required 一类身份门禁
         // 时，回 Google 优先的绑定引导（让 LLM 绑定再重试），而不是当成普通失败。这是
         // anonymous-first 下的预期分叉。读/搜索匿名放行，不会走到这里。

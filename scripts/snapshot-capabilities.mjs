@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // scripts/snapshot-capabilities.mjs
 //
-// 在 npm publish / npm pack / clawhub publish 之前，从 prod hi 平台一次性把 14 个（未来 N 个）
+// 在 npm publish / npm pack / clawhub publish 之前，从 prod hi 平台一次性把当前全量
 // PublicAgentCapability 的完整 input schema 拉下来，写到 dist/capabilities.snapshot.json，
 // 跟随 dist/ 一起被打包进 plugin tarball。OpenClaw 端 plugin register(api) 必须是同步的
 // （v2026.4.23+ runPluginRegisterSync 看到 Promise 直接 throw "plugin register must be
@@ -75,6 +75,7 @@ async function main() {
   console.log(`[snapshot-capabilities] fetching ${ENDPOINT}`);
   const resp = await fetch(ENDPOINT, {
     headers: { accept: 'application/json' },
+    signal: AbortSignal.timeout(30_000),
   });
   if (!resp.ok) {
     const body = await resp.text().catch(() => '');
@@ -91,7 +92,7 @@ async function main() {
   if (items.length === 0) {
     // 平台返回空数组通常意味着这次 fetch 命中了部署窗口（capabilities 表正在 migrate）或
     // 鉴权出错把 list 过滤光了。无论哪种都不能 ship —— 当前 1.0.x 系列 plugin 主要价值
-    // 就是把 14 个 capability 暴露给 LLM，14 → 0 是退步而不是进步。
+    // 就是把当前 capability 暴露给 LLM，非空 → 0 是退步而不是进步。
     throw new Error(`platform returned 0 capabilities — refusing to ship empty snapshot`);
   }
   for (const item of items) {

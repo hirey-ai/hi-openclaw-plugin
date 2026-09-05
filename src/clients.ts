@@ -10,8 +10,8 @@
 import {
   createHiAgentClients,
   exchangeHiAgentClientCredentialsToken,
-  type HiAgentGatewayClient,
-  type HiAgentPlatformClient,
+  HiAgentGatewayClient,
+  HiAgentPlatformClient,
   type HiAgentPlatformWellKnown,
 } from '@hirey/hi-agent-sdk';
 import {
@@ -22,6 +22,8 @@ import {
   type StaleIdentityQuarantine,
 } from './state.js';
 import { PLUGIN_VERSION } from './version.js';
+import { bootstrapPendingAgent } from './bootstrap.js';
+import {createHash} from 'node:crypto';
 
 export type HiAuthorizedClients = {
   state: HiPersistedState;
@@ -30,6 +32,7 @@ export type HiAuthorizedClients = {
   platform: HiAgentPlatformClient;
   wellKnown: HiAgentPlatformWellKnown;
   quarantined: StaleIdentityQuarantine | null;
+  expiresAt?: number;
 };
 
 export type HiPluginReleasePolicy = {
@@ -44,6 +47,42 @@ export type HiPluginReleasePolicy = {
 };
 
 const PLUGIN_POLICY_TIMEOUT_MS = 5_000;
+
+const policyCache = new Map<string, { policy: HiPluginReleasePolicy | null; checkedAt: number; failed?: boolean; pending?: Promise<void> }>();
+const POLICY_CACHE_TTL_MS = 60_000;
+
+// Local status must remain local-speed. Refresh in the background, sharing one
+// bounded request per origin; explicit remote checks wait for that same request.
+export async function getStatusPluginReleasePolicy(platformBaseUrl: string, waitForRemote = false): Promise<Record<string, unknown>> {
+  const key = platformBaseUrl.replace(/\/+$/, '');
+  let entry = policyCache.get(key);
+  if (!entry) {
+    if (policyCache.size >= 64) policyCache.delete(policyCache.keys().next().value!);
+    entry = { policy: null, checkedAt: 0 };
+    policyCache.set(key, entry);
+  }
+  if (!entry.pending && (waitForRemote || Date.now() - entry.checkedAt >= POLICY_CACHE_TTL_MS)) {
+    const current = entry;
+    current.pending = fetchPluginReleasePolicy(key).then(policy => {
+      current.policy = policy;
+      current.checkedAt = Date.now();
+      current.failed = false;
+    }).catch(() => {
+      // A temporary outage must not erase a known mandatory upgrade. Preserve
+      // the last policy and explicitly mark it stale until a successful refresh.
+      current.failed = true;
+      current.checkedAt = Date.now();
+    }).finally(() => { current.pending = undefined; });
+  }
+  if (waitForRemote) await entry.pending;
+  return {
+    host: 'openclaw', latest: null, minimum_supported: null,
+    update_required: null, update_recommended: null,
+    ...entry.policy,
+    checked_at: entry.checkedAt ? new Date(entry.checkedAt).toISOString() : null,
+    check_status: entry.pending ? 'refreshing' : entry.failed && entry.policy ? 'stale' : entry.policy ? 'checked' : 'unavailable',
+  };
+}
 
 export async function fetchPluginReleasePolicy(
   platformBaseUrl: string,
@@ -138,37 +177,29 @@ export async function ensureCredential(args: {
     // 拿到 slot 后再读一次：可能上一个并发请求刚注册完。
     const recheck = await readState(args.stateDir, args.profile);
     if (recheck.identity) return recheck;
-    const pub = await buildPublicClients(args.platformBaseUrl);
     const callerMetadata =
       args.metadata && typeof args.metadata === 'object' && !Array.isArray(args.metadata) ? args.metadata : {};
-    const reg = await pub.gateway.register({
-      display_name: args.displayName?.trim() || 'OpenClaw Hi Agent',
-      agent_kind: 'external',
-      capabilities: [],
-      metadata: {
-        ...callerMetadata,
-        host: 'openclaw',
-        plugin: 'hi-openclaw-plugin',
-        plugin_version: PLUGIN_VERSION,
-      },
+    const reg = await bootstrapPendingAgent({
+      ...args,
+      metadata: callerMetadata,
     });
     const identity: HiIdentityState = {
-      agent_id: reg.agent.agent_id,
-      installation_id: reg.installation.installation_id,
-      display_name: reg.agent.display_name,
-      agent_kind: reg.agent.agent_kind,
-      client_id: reg.auth.client_id,
-      client_secret: reg.auth.client_secret,
-      installation_subject: reg.auth.installation_subject ?? reg.installation.installation_id,
-      issuer: reg.auth.issuer,
-      audience: reg.auth.audience,
-      token_url: reg.auth.token_url,
-      jwks_url: reg.auth.jwks_url,
+      agent_id: reg.agentId,
+      installation_id: '',
+      display_name: args.displayName?.trim() || 'OpenClaw Hi Agent',
+      agent_kind: 'external',
+      client_id: reg.clientId,
+      client_secret: reg.clientSecret,
+      installation_subject: reg.clientId,
+      issuer: new URL(reg.tokenUrl).origin,
+      audience: '',
+      token_url: reg.tokenUrl,
+      jwks_url: reg.jwksUrl,
       activated_at: null,
       delivery_capabilities: null,
       plugin_version_synced: null,
-      anonymous: false,
-      api_key: null,
+      anonymous: true,
+      api_key: reg.apiKey,
     };
     const next = await updateState(args.stateDir, args.profile, (cur) => ({
       ...cur,
@@ -186,24 +217,61 @@ export async function ensureCredential(args: {
   return p;
 }
 
-export async function buildAuthorizedClients(args: {
+const authorizedCache = new Map<string, {value?: HiAuthorizedClients; pending?: Promise<HiAuthorizedClients>}>();
+export function invalidateAuthorizedClients(stateDir: string, profile: string) {
+  const prefix = `${stateDir}|${profile}|`;
+  for (const key of authorizedCache.keys()) if (key.startsWith(prefix)) authorizedCache.delete(key);
+}
+
+export async function buildAuthorizedClients(args: {stateDir: string; profile: string; platformBaseUrl: string}): Promise<HiAuthorizedClients> {
+  const state = await ensureCredential(args);
+  const fingerprint = createHash('sha256').update(`${state.identity?.client_id}|${state.identity?.client_secret}`).digest('hex');
+  const key = `${args.stateDir}|${args.profile}|${args.platformBaseUrl}|${fingerprint}`;
+  let entry = authorizedCache.get(key);
+  if (entry?.pending) return entry.pending;
+  if (entry?.value && (entry.value.expiresAt || 0) > Date.now()) return entry.value;
+  if (!entry) {
+    if (authorizedCache.size >= 64) authorizedCache.delete(authorizedCache.keys().next().value!);
+    entry = {}; authorizedCache.set(key, entry);
+  }
+  const current = entry;
+  current.pending = buildAuthorizedClientsUncached(args, state).then(value => {current.value = value; return value;})
+    .finally(() => {current.pending = undefined;});
+  return current.pending;
+}
+
+async function buildAuthorizedClientsUncached(args: {
   stateDir: string;
   profile: string;
   platformBaseUrl: string;
-}): Promise<HiAuthorizedClients> {
+}, state: HiPersistedState): Promise<HiAuthorizedClients> {
   // 没有 identity 时不再 throw hi_identity_missing，而是 register-once 一个稳定 agent —— 这样
   // "装好插件直接搜索"就能用；register-once + 复用 = 零 churn。
-  const state = await ensureCredential(args);
   if (!state.identity) {
     throw new Error('hi_identity_unavailable: agent registration failed; retry hi_agent_status');
   }
+  const contextualFetch: typeof fetch = async (input, init) => {
+    const headers = new Headers(init?.headers);
+    headers.set('x-hirey-plugin-host', 'openclaw');
+    headers.set('x-hirey-plugin-version', PLUGIN_VERSION);
+    const response = await fetch(input, {...init, headers, signal: init?.signal || AbortSignal.timeout(15_000)});
+    if (response.status === 401) invalidateAuthorizedClients(args.stateDir, args.profile);
+    return response;
+  };
+  // Discovery is public and independent of OAuth. Do not send a bearer to the
+  // discovery host, and do not serialize two network round trips on cold start.
+  const discovery = createHiAgentClients({platformBaseUrl: args.platformBaseUrl, token: '', fetchImpl: contextualFetch});
   let token;
+  let discovered;
+  let tokenReceivedAt = 0;
   try {
-    token = await exchangeHiAgentClientCredentialsToken({
+    const deadline = AbortSignal.timeout(15_000);
+    [token, discovered] = await Promise.all([exchangeHiAgentClientCredentialsToken({
       tokenUrl: state.identity.token_url,
       clientId: state.identity.client_id,
       clientSecret: state.identity.client_secret,
-    });
+      fetchImpl: (input, init) => contextualFetch(input, {...init, signal: deadline}),
+    }).then(value => {tokenReceivedAt = Date.now(); return value;}), discovery]);
   } catch (err) {
     // 关键反 churn 改动：OAuth 失败**不再 auto-quarantine + 重注册**（那正是 openclaw 满天飞
     // 孤儿 agent 的根因——一次抖动/吊销就换一个新 agent）。保留本地凭证、抛清晰错误：让用户
@@ -217,17 +285,21 @@ export async function buildAuthorizedClients(args: {
     }
     throw err;
   }
-  const clients = await createHiAgentClients({
-    platformBaseUrl: args.platformBaseUrl,
-    token: token.access_token,
-  });
+  const wellKnown = discovered.wellKnown;
+  const clientOptions = {token: token.access_token, fetchImpl: contextualFetch};
+  const platform = new HiAgentPlatformClient({...clientOptions,
+    baseUrl: String(wellKnown?.platform?.platform_base_url || '').trim() || args.platformBaseUrl});
+  const gateway = new HiAgentGatewayClient({...clientOptions,
+    baseUrl: String(wellKnown?.platform?.registry_base_url || '').trim() || args.platformBaseUrl});
   return {
     state,
     accessToken: token.access_token,
-    gateway: clients.gateway,
-    platform: clients.platform,
-    wellKnown: clients.wellKnown,
+    gateway,
+    platform,
+    wellKnown,
     quarantined: peekQuarantineNotice(),
+    expiresAt: tokenReceivedAt + Math.min(token.access_token.startsWith('hi_ai_') ? 10_000 : 60_000,
+      Math.max(0, Number(token.expires_in || 0) * 1000 - 30_000)),
   };
 }
 

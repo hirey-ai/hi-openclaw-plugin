@@ -1,4 +1,4 @@
-// hi-openclaw-plugin entry: register Hirey AI 的 control tools + 14 platform capabilities +
+// hi-openclaw-plugin entry: register Hirey AI 的 control tools + 发布时快照中的 platform capabilities +
 // agent-events claim service + webhook ingress route 进 OpenClaw gateway 进程。
 //
 // 设计原则：
@@ -36,8 +36,19 @@ import { ensurePluginToolsAlsoAllowed } from './utils/openclaw-config.js';
 
 const _registeredApis = new WeakSet<PluginRegisterApi>();
 
+export function isOpenClawPluginInstallCommand(argv: string[] = process.argv): boolean {
+  return argv.some((arg, index) => arg === 'plugins' && argv[index + 1] === 'install');
+}
+
 function defaultedConfig(raw: HiOpenClawPluginConfig | undefined): Required<HiOpenClawPluginConfig> {
   return {
+    // Opt-in only. Installing/upgrading must not start consuming real events.
+    modernEvents: {
+      enabled: raw?.modernEvents?.enabled === true,
+      mode: raw?.modernEvents?.mode === 'local_session' ? 'local_session' : 'channel',
+      channel: typeof raw?.modernEvents?.channel === 'string' ? raw.modernEvents.channel.trim() : '',
+      to: typeof raw?.modernEvents?.to === 'string' ? raw.modernEvents.to.trim() : '',
+    },
     // 默认 prod URL；改这里时 scripts/snapshot-capabilities.mjs 的 PLATFORM_BASE_URL 也要同步改。
     platformBaseUrl: raw?.platformBaseUrl?.trim() || 'https://hi.hirey.ai',
     profile: raw?.profile?.trim() || 'openclaw-main',
@@ -173,19 +184,28 @@ export default function registerHiOpenClawPlugin(api: PluginRegisterApi): void {
   // explicit allow override 把 read/exec/sessions_* 等内置工具全 filter 掉，整个 LLM run 没工具用。
   // 因此 plugin 自己幂等 patch，atomic write，patch 完不立刻 restart gateway —— config hot-reload
   // watcher 会自然 pick up，下一个 LLM session 起来 tool inventory 就 contains hi_*。
-  void ensurePluginToolsAlsoAllowed()
-    .then((res) => {
-      if (res.changed) {
-        logger.info?.('[hi-openclaw-plugin] auto-patched tools.alsoAllow=group:plugins so plugin tools become visible to LLM in coding profile', {
-          before: res.also_allow_before, after: res.also_allow_after,
+  // `openclaw plugins install` owns an optimistic config transaction. Mutating
+  // openclaw.json while that command is still committing its install record
+  // makes the host fail with ConfigMutationConflictError. Installation only
+  // validates/registers here; the mandatory gateway restart performs this
+  // idempotent self-heal on the next normal plugin load.
+  if (isOpenClawPluginInstallCommand()) {
+    logger.info?.('[hi-openclaw-plugin] deferred tools.alsoAllow self-heal until post-install restart');
+  } else {
+    void ensurePluginToolsAlsoAllowed()
+      .then((res) => {
+        if (res.changed) {
+          logger.info?.('[hi-openclaw-plugin] auto-patched tools.alsoAllow=group:plugins so plugin tools become visible to LLM in coding profile', {
+            before: res.also_allow_before, after: res.also_allow_after,
+          });
+        }
+      })
+      .catch((err: any) => {
+        logger.warn?.('[hi-openclaw-plugin] tools.alsoAllow auto-patch failed (LLM may need to do it manually)', {
+          error: String(err?.message || err),
         });
-      }
-    })
-    .catch((err: any) => {
-      logger.warn?.('[hi-openclaw-plugin] tools.alsoAllow auto-patch failed (LLM may need to do it manually)', {
-        error: String(err?.message || err),
       });
-    });
+  }
 
   // 启动时跑一次 reconcile：state.identity 已存在但 plugin_version_synced 跟当前 PLUGIN_VERSION
   // 不一致时（比如老用户从 1.0.33 升到 1.0.37），主动把新版本 metadata + 当前 delivery_capabilities

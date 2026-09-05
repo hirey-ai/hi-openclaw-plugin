@@ -76,8 +76,13 @@ export type HiPersistedState = {
 
 export const DEFAULT_PROFILE = 'openclaw-main';
 
+export function resolveOpenClawStateRoot(env: NodeJS.ProcessEnv = process.env): string {
+  const configured = String(env.OPENCLAW_STATE_DIR || '').trim();
+  return configured ? path.resolve(configured) : path.join(os.homedir(), '.openclaw');
+}
+
 export function resolveStateDir(profile: string): string {
-  return path.join(os.homedir(), '.openclaw', 'hi-mcp', profile);
+  return path.join(resolveOpenClawStateRoot(), 'hi-mcp', profile);
 }
 
 export function resolveStateFile(stateDir: string, profile: string): string {

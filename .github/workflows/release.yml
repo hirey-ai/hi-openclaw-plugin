@@ -1,8 +1,7 @@
 name: release
 
-# 触发：push 到 main 时跑一次 version-bump detection。package.json 的 version 字段在本次
-# commit 里发生了变化才会发版；否则全部 step 都 skip（idempotent，未 bump 的纯文档/测试
-# commit 不会重复 publish）。
+# 触发：仅允许人工 workflow_dispatch，并要求输入待发布版本。合并包含 version bump 的 PR
+# 不会自动发版；发布人确认本地验收完成后，再显式启动这条 workflow。
 #
 # 发版目标（一次性两个 registry，缺一即 fail，避免 npm 发了 ClawHub 没发那种半成品状态）：
 # 1. npm prod scope `@hirey-ai/hirey`（OpenClaw 5.2~5.3 fallback / Claude Desktop 等也能用）
@@ -23,12 +22,15 @@ name: release
 #
 # 上次踩坑（2026-05-28）：1.0.34/1.0.35/1.0.36 三次 bump 后只手动 npm publish 了，
 # 没人记得 publish ClawHub，老 OpenClaw 用户 install clawhub:hirey 永远停在 1.0.33。
-# 这条 workflow 就是消灭那条 manual-step。
+# 这条 workflow 保留统一发布两个 registry 的能力，但把“合并”和“发布”拆成两个明确动作。
 
 on:
-  push:
-    branches: [main]
   workflow_dispatch:
+    inputs:
+      version:
+        description: "已完成验收、准备发布的 package.json 版本（例如 1.0.75）"
+        required: true
+        type: string
 
 permissions:
   contents: read
@@ -47,39 +49,37 @@ jobs:
       sha: ${{ steps.compare.outputs.sha }}
       changelog: ${{ steps.compare.outputs.changelog }}
     steps:
-      - name: Checkout main with previous commit
+      - name: Checkout selected revision
         uses: actions/checkout@v5
-        with:
-          fetch-depth: 2
 
-      - name: Detect package.json version bump
+      - name: Verify explicitly confirmed package version
         id: compare
+        env:
+          EXPECTED_VERSION: ${{ inputs.version }}
         run: |
           current=$(jq -r '.version' package.json)
-          if git rev-parse HEAD~1 >/dev/null 2>&1; then
-            previous=$(git show HEAD~1:package.json | jq -r '.version' 2>/dev/null || echo "")
-          else
-            previous=""
-          fi
           echo "current=$current"
-          echo "previous=$previous"
-          if [[ "$current" != "$previous" && -n "$current" ]]; then
-            echo "bumped=true" >> "$GITHUB_OUTPUT"
-            echo "version=$current" >> "$GITHUB_OUTPUT"
-            echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
-            # 提取 commit subject 当 changelog；clawhub publish 用得到。
-            cl=$(git log -1 --pretty=%s)
-            # multiline-safe via heredoc to $GITHUB_OUTPUT (action runner pattern)
-            {
-              echo "changelog<<EOF"
-              echo "$cl"
-              echo "EOF"
-            } >> "$GITHUB_OUTPUT"
-            echo "Bumped: $previous → $current"
-          else
-            echo "bumped=false" >> "$GITHUB_OUTPUT"
-            echo "No version bump in this commit; skipping publish."
-          fi
+          echo "confirmed=$EXPECTED_VERSION"
+          [[ "$EXPECTED_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+([+-][0-9A-Za-z.-]+)?$ ]] || {
+            echo "Invalid release version: $EXPECTED_VERSION" >&2
+            exit 1
+          }
+          [[ "$current" == "$EXPECTED_VERSION" ]] || {
+            echo "package.json version $current does not match confirmed version $EXPECTED_VERSION" >&2
+            exit 1
+          }
+          echo "bumped=true" >> "$GITHUB_OUTPUT"
+          echo "version=$current" >> "$GITHUB_OUTPUT"
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          # 提取 commit subject 当 changelog；clawhub publish 用得到。
+          cl=$(git log -1 --pretty=%s)
+          # multiline-safe via heredoc to $GITHUB_OUTPUT (action runner pattern)
+          {
+            echo "changelog<<EOF"
+            echo "$cl"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+          echo "Confirmed release: $current"
 
   publish-npm:
     needs: detect-bump

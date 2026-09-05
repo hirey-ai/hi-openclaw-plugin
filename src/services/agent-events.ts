@@ -30,10 +30,13 @@ import {
 } from '../clients.js';
 import { resolveStateDir, readState, updateState } from '../state.js';
 import { buildOpenClawHookPayloadWithRoute } from '../utils/openclaw-hooks-payload.js';
-import { ensureOpenClawHooksConfigured, readGatewayPort, findRecentUserSessionKey } from '../utils/openclaw-config.js';
+import { ensureOpenClawHooksConfigured, readGatewayPort, findRecentUserSessionKey, resolveOpenClawConfigPath } from '../utils/openclaw-config.js';
 import { streamAgentEvents } from '@hirey/hi-agent-sdk';
 import { appendPendingPush } from './pending-pushes.js';
 import { isPushInjectionActive } from './push-injection-state.js';
+import { runModernEventReceiver } from './modern-agent-events.js';
+import path from 'node:path';
+import fs from 'node:fs/promises';
 
 // 哪些 event topics + payload kind 需要被强制落到 user 当前可见的 chat。
 //
@@ -82,11 +85,57 @@ type DaemonRuntimeConfig = {
   gateway_port: number;
 };
 
+// Current host config is authoritative. Never resurrect a stale copied token
+// from identity runtime state, and never enable or repair hooks while polling.
+export async function __testing_readModernHooksConfig(
+  env: NodeJS.ProcessEnv = process.env,
+): Promise<DaemonRuntimeConfig | null> {
+  try {
+    const root = JSON.parse(await fs.readFile(resolveOpenClawConfigPath(env), 'utf8'));
+    const hooks = root?.hooks;
+    const port = root?.gateway?.port ?? 18789;
+    const hooksPath = hooks?.path ?? '/hooks';
+    if (hooks?.enabled !== true || typeof hooks.token !== 'string' || !hooks.token.trim() ||
+        typeof hooksPath !== 'string' || !/^\/[A-Za-z0-9_/-]+$/.test(hooksPath) ||
+        hooksPath.includes('//') || !Number.isInteger(port) || port < 1 || port > 65535) return null;
+    return { hooks_token: hooks.token, hooks_path: hooksPath, gateway_port: port };
+  } catch { return null; }
+}
+
 function resolveHooksUrl(rt: DaemonRuntimeConfig): string {
   const path = rt.hooks_path.startsWith('/') ? rt.hooks_path : `/${rt.hooks_path}`;
   // path 形如 "/hooks"；最终 endpoint 是 "/hooks/agent"
   const cleanedPath = path.endsWith('/') ? path.slice(0, -1) : path;
   return `http://127.0.0.1:${rt.gateway_port}${cleanedPath}/agent`;
+}
+
+// Hook acceptance only; this does not attest to model/channel completion.
+export async function __testing_deliverModernEventToHooks(args: {
+  runtime: DaemonRuntimeConfig; event: any; signal: AbortSignal;
+  route: { channel?: string; to?: string; localSession?: boolean };
+}): Promise<boolean> {
+  const localSession = args.route.localSession === true;
+  if (!localSession && (!args.route.channel?.trim() || !args.route.to?.trim()
+      || args.route.channel.trim().toLowerCase() === 'webchat')) return false;
+  const body = buildOpenClawHookPayloadWithRoute({
+    event: { ...args.event, reply_route_snapshot: undefined },
+    config: localSession
+      ? { channel: 'last' }
+      : { channel: args.route.channel, to: args.route.to },
+  });
+  delete body.sessionKey;
+  // WebChat is an internal UI surface, not an outbound channel. This mode
+  // creates a visible isolated session while making external delivery impossible.
+  if (localSession) body.deliver = false;
+  const response = await fetch(resolveHooksUrl(args.runtime), {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', authorization: `Bearer ${args.runtime.hooks_token}`,
+      'idempotency-key': `hirey-event:${args.event.event_id}` },
+    body: JSON.stringify(body), signal: args.signal,
+  });
+  if (!response.ok) { await response.body?.cancel(); return false; }
+  const accepted = await response.json() as { ok?: boolean; runId?: string };
+  return accepted?.ok === true && typeof accepted.runId === 'string' && !!accepted.runId.trim();
 }
 
 // Exported for e2e harness use only. Not a stable plugin API surface.
@@ -262,6 +311,47 @@ export function buildAgentEventsService(
     async start(ctx: PluginServiceContext) {
       stopped = false;
       const logger = ctx.logger;
+      const initialState = await readState(stateDir, config.profile);
+      if (!initialState.identity || (initialState.identity.api_key && !initialState.identity.installation_id)) {
+        const abort = new AbortController();
+        activeAbort = abort;
+        const signal = ctx.signal ? AbortSignal.any([abort.signal, ctx.signal]) : abort.signal;
+        let runtime: DaemonRuntimeConfig | null = null;
+        void runModernEventReceiver({
+          platformBaseUrl: config.platformBaseUrl,
+          signal,
+          intervalMs: config.claimPollIntervalMs,
+          receiptFile: path.join(stateDir, `${config.profile}.event-receipts.json`),
+          ready: async () => {
+            const route = config.modernEvents;
+            const localSession = route?.mode === 'local_session';
+            if (route?.enabled !== true || (!localSession && (!route.channel?.trim()
+                || !route.to?.trim() || route.channel.trim().toLowerCase() === 'webchat'))) return null;
+            const state = await readState(stateDir, config.profile);
+            if (!state.identity?.api_key || state.identity.installation_id) return null;
+            runtime = await __testing_readModernHooksConfig();
+            if (!runtime) return null;
+            const auth = await buildAuthorizedClients({ stateDir, profile: config.profile, platformBaseUrl: config.platformBaseUrl });
+            if (auth.accessToken.startsWith('hi_ai_')) return null;
+            return { token: auth.accessToken };
+          },
+          deliver: async (event, deliverySignal) => {
+            if (!runtime) return false;
+            // Locally configured route is authoritative; never trust event routes
+            // or pick the most recent chat for unsolicited background delivery.
+            return __testing_deliverModernEventToHooks({
+              runtime, event, signal: deliverySignal,
+              route: {
+                channel: config.modernEvents.channel,
+                to: config.modernEvents.to,
+                localSession: config.modernEvents.mode === 'local_session',
+              },
+            });
+          },
+          onError: () => logger.warn?.('[hi-openclaw-plugin] modern event receiver will retry'),
+        }).catch(() => logger.error?.('[hi-openclaw-plugin] modern event receiver stopped; inspect local receipt storage'));
+        return;
+      }
       logger.info?.('[hi-openclaw-plugin] agent-events service starting (sse pull_stream + claim drain)', {
         profile: config.profile,
         platform: config.platformBaseUrl,
@@ -273,6 +363,10 @@ export function buildAgentEventsService(
       }> => {
         const state = await readState(stateDir, config.profile);
         if (!state.identity) return { auth: null, rt: null };
+        // Modern API-key registration has no legacy installation/delivery
+        // declaration. Do not mutate hooks or start the retired SSE path until
+        // a supported native delivery setup has been explicitly implemented.
+        if (state.identity.api_key && !state.identity.installation_id) return { auth: null, rt: null };
         let inst = state.runtime?.install;
         if (!inst?.hooks_token || !inst?.hooks_path || !inst?.gateway_port) {
           // 自愈：identity 存在但 hooks 未配置时（hi_agent_install 在旧版本运行、或 state

@@ -1,4 +1,4 @@
-// 4 个核心 control tools：hi_agent_status / hi_agent_install / hi_agent_doctor / hi_agent_reset。
+// 9 个本地 control tools：安装、状态、诊断、恢复、事件和身份收敛。
 // 业务逻辑全部委托给 @hirey/hi-agent-sdk 已封装好的 platform/gateway client，本文件只做：
 // - input schema 定义
 // - state file 持久化跟 OAuth client 装配
@@ -10,31 +10,43 @@ import {
   INSTALL_WELCOME_ONBOARDING_KIND,
   INSTALL_WELCOME_ONBOARDING_INSTRUCTION,
   DEFAULT_INTENT_OPTIONS,
-  type RecentActivityItem,
   type BootstrapOnboardingPayload,
 } from '@hirey/hi-agent-contracts';
 import {
   buildAuthorizedClients,
+  invalidateAuthorizedClients,
   ensureCredential,
-  fetchPluginReleasePolicy,
+  getStatusPluginReleasePolicy,
   loadStateWithQuarantine,
   peekQuarantineNotice,
 } from '../clients.js';
 import {
   resolveStateDir,
+  resolveOpenClawStateRoot,
   resolveStateFile,
   updateState,
 } from '../state.js';
-import { ensureOpenClawHooksConfigured, ensurePluginToolsAlsoAllowed, readGatewayPort, findRecentUserSessionKey } from '../utils/openclaw-config.js';
+import {
+  ensureOpenClawHooksConfigured,
+  ensurePluginToolsAlsoAllowed,
+  findRecentUserSessionKey,
+  readGatewayPort,
+  resolveOpenClawConfigPath,
+} from '../utils/openclaw-config.js';
 import { buildErrorDetailFields } from '../utils/error-detail.js';
 import { PLUGIN_VERSION } from '../version.js';
 import fs from 'node:fs/promises';
 import fsSync from 'node:fs';
-import os from 'node:os';
 import path from 'node:path';
 
 function defaultStateDir(config: Required<HiOpenClawPluginConfig>): string {
   return config.stateDir || resolveStateDir(config.profile);
+}
+
+export function isVerifiedModernIdentity(me: any, storedAgentId: string): boolean {
+  return ['agent_id','person_id','workspace_id','agent_session_id'].every(key =>
+    typeof me?.[key] === 'string' && me[key].trim().length > 0)
+    && !!storedAgentId && me.agent_id === storedAgentId;
 }
 
 // 找 OpenClaw workspace 路径——register API 不暴露，只能从已知约定推。
@@ -45,14 +57,14 @@ function resolveOpenClawWorkspaceDir(): string {
   // try openclaw.json
   try {
     const cfg = JSON.parse(
-      fsSync.readFileSync(path.join(os.homedir(), '.openclaw', 'openclaw.json'), 'utf8'),
+      fsSync.readFileSync(resolveOpenClawConfigPath(), 'utf8'),
     );
     const wd = cfg?.agents?.defaults?.workspace;
     if (typeof wd === 'string' && wd.trim()) return wd.trim();
   } catch {
     // file missing / parse error / ...：都没所谓，用约定默认
   }
-  return path.join(os.homedir(), '.openclaw', 'workspace');
+  return path.join(resolveOpenClawStateRoot(), 'workspace');
 }
 
 // OpenClaw 的"它叫什么名字"在 workspace/IDENTITY.md。SOUL.md 协议要求 LLM 每个 session
@@ -96,10 +108,21 @@ function readOpenClawIdentityName(workspaceDir: string): string | null {
   }
 }
 
+// Defense in depth for remote control responses, including nested installation
+// credentials. Claim-export's short-lived claim_token is intentionally supported.
+export function redactControlCredentials(value: unknown): any {
+  if (Array.isArray(value)) return value.map(redactControlCredentials);
+  if (!value || typeof value !== 'object') return value;
+  return Object.fromEntries(Object.entries(value).filter(([key]) =>
+    !/^(client_secret|api_key|hooks_token|access_token|refresh_token|authorization|password|secret)$/i.test(key),
+  ).map(([key, item]) => [key, redactControlCredentials(item)]));
+}
+
 function asJsonResult(payload: Record<string, unknown>): PluginToolResult {
+  const safe = redactControlCredentials(payload);
   return {
-    structuredContent: payload,
-    content: [{ type: 'text', text: JSON.stringify(payload, null, 2) }],
+    structuredContent: safe,
+    content: [{ type: 'text', text: JSON.stringify(safe, null, 2) }],
   };
 }
 
@@ -132,24 +155,14 @@ export function buildHiAgentStatusTool(config: Required<HiOpenClawPluginConfig>)
       const args = (params || {}) as { include_remote?: boolean };
       try {
         const state = await loadStateWithQuarantine(stateDir, config.profile, config.platformBaseUrl);
-        let pluginPolicy: Record<string, unknown> | null = null;
-        try {
-          pluginPolicy = await fetchPluginReleasePolicy(config.platformBaseUrl);
-        } catch (err: any) {
-          pluginPolicy = {
-            host: 'openclaw',
-            latest: null,
-            minimum_supported: null,
-            update_required: null,
-            update_recommended: null,
-            error: String(err?.message || err),
-          };
-        }
+        // Policy and identity are independent remote reads. Start the bounded
+        // policy check now, but do not delay OAuth/discovery or the real /me.
+        const pluginPolicy = getStatusPluginReleasePolicy(config.platformBaseUrl, !!args.include_remote);
         const summary = {
           ok: true,
           plugin: 'hi-openclaw-plugin',
           plugin_version: PLUGIN_VERSION,
-          plugin_policy: pluginPolicy,
+          plugin_policy: null as Record<string, unknown> | null,
           profile: config.profile,
           state_dir: stateDir,
           state_file: resolveStateFile(stateDir, config.profile),
@@ -166,14 +179,51 @@ export function buildHiAgentStatusTool(config: Required<HiOpenClawPluginConfig>)
             agent_id: state.identity?.agent_id || null,
             installation_id: state.identity?.installation_id || null,
           },
-          state,
+          // Allowlist the diagnostic state; never serialize persisted identity or
+          // arbitrary future state fields into the model's context.
+          state: {
+            profile: state.profile,
+            identity: state.identity ? {
+              agent_id: state.identity.agent_id,
+              installation_id: state.identity.installation_id,
+              anonymous: state.identity.anonymous,
+              activated_at: state.identity.activated_at,
+              plugin_version_synced: state.identity.plugin_version_synced,
+            } : null,
+            runtime: {
+              last_consumed_stream_seq: state.runtime.last_consumed_stream_seq,
+              updated_at: state.runtime.updated_at,
+              install: {
+                host_kind: state.runtime.install.host_kind,
+                receiver_last_started_at: state.runtime.install.receiver_last_started_at,
+                receiver_has_error: !!state.runtime.install.receiver_last_error,
+                hooks_configured: !!state.runtime.install.hooks_token,
+                gateway_port: state.runtime.install.gateway_port,
+              },
+            },
+          },
           remote: null as Record<string, unknown> | null,
+        };
+        const finish = async () => {
+          summary.plugin_policy = await pluginPolicy;
+          return asJsonResult(summary);
         };
         if (args.include_remote && state.identity) {
           try {
             const auth = await buildAuthorizedClients({
               stateDir, profile: config.profile, platformBaseUrl: config.platformBaseUrl,
             });
+            if (auth.accessToken.startsWith('hi_ai_')) {
+              summary.summary.activated = false;
+              summary.remote = {authenticated: true, status: 'pending', ready_for_public_reads: true, identity_bound: false};
+              return finish();
+            }
+            if (state.identity.api_key) {
+              const me = await auth.gateway.me() as any;
+              summary.remote = {me};
+              summary.summary.activated = isVerifiedModernIdentity(me, state.identity.agent_id);
+              return finish();
+            }
             const [me, installation, endpoints, subscriptions] = await Promise.all([
               auth.gateway.me(),
               auth.gateway.getInstallation(),
@@ -182,10 +232,11 @@ export function buildHiAgentStatusTool(config: Required<HiOpenClawPluginConfig>)
             ]);
             summary.remote = { me, installation, endpoints, subscriptions };
           } catch (err: any) {
+            summary.summary.activated = false;
             summary.remote = { error: String(err?.message || err) };
           }
         }
-        return asJsonResult(summary);
+        return finish();
       } catch (err: any) {
         return asErrorResult('hi_agent_status_failed', buildErrorDetailFields(err));
       }
@@ -200,7 +251,7 @@ export function buildHiAgentInstallTool(config: Required<HiOpenClawPluginConfig>
     name: 'hi_agent_install',
     label: 'Hi agent setup',
     description:
-      'AGENT-side setup step on the Hi platform. Ensures this OpenClaw host has ONE STABLE agent + credential (register-once) and wires push for it. The credential is persisted locally and REUSED forever — restart / new window / repeated calls all map to the SAME agent_id (no duplicate-agent churn; that churn was the old bug). After it returns, reading & searching Hi (people, listings, taxonomy) work immediately even while the installation is pending. The agent starts UNBOUND (no verified identity): WRITING — creating/editing a profile, posting a listing, contacting anyone, scheduling — is gated by the platform and requires the user to bind an identity first, default Google (google_link) or phone (phone_binding) or email (email_binding). A `phone_binding_required` / `needs_binding` error on a write means exactly this: bind once, then retry the write — binding attaches to the SAME agent (no new agent). Fully idempotent. NOTE: structurally different from `openclaw plugins install clawhub:hirey` (the CLI that lays the plugin tarball on disk + registers it with the gateway). The CLI install puts hi_* tools on the gateway; THIS tool sets up the Hi-platform agent so those tools work. Always report the REAL agent_id returned by this tool; never fabricate one. If you cannot see this tool in your run inventory yet, the install just completed — wait for the user\'s next message.',
+      'AGENT-side setup step on the Hi platform. Ensures this OpenClaw host has ONE STABLE agent + credential (register-once). The credential is persisted locally and REUSED forever — restart / new window / repeated calls all map to the SAME agent_id (no duplicate-agent churn; that churn was the old bug). Modern event reception remains disabled unless the user separately opts into modernEvents with an approved local session or external channel destination; setup does not claim push readiness. After it returns, reading & searching Hi (people, listings, taxonomy) work immediately even while the installation is pending. The agent starts UNBOUND (no verified identity): WRITING — creating/editing a profile, posting a listing, contacting anyone, scheduling — is gated by the platform and requires the user to bind an identity first, default Google (google_link) or phone (phone_binding) or email (email_binding). A `phone_binding_required` / `needs_binding` error on a write means exactly this: bind once, then retry the write — binding attaches to the SAME agent (no new agent). Fully idempotent. NOTE: structurally different from `openclaw plugins install clawhub:hirey` or `openclaw plugins install npm:@hirey-ai/hirey` (the CLI command that lays the plugin tarball on disk + registers it with the gateway). The CLI install puts hi_* tools on the gateway; THIS tool sets up the Hi-platform agent so those tools work. Always report the REAL agent_id returned by this tool; never fabricate one. If you cannot see this tool in your run inventory yet, the install just completed — wait for the user\'s next message.',
     parameters: {
       type: 'object',
       additionalProperties: false,
@@ -224,7 +275,7 @@ export function buildHiAgentInstallTool(config: Required<HiOpenClawPluginConfig>
         },
         metadata: {
           type: 'object',
-          description: 'Optional caller-supplied metadata merged into agent metadata at first register. Common use: channel attribution `{"channel_code":"..."}` from an invite landing page. The plugin still reserves the keys host/plugin/plugin_version (always set to identify this plugin) — caller-supplied values for those keys will be ignored. MUST forward channel_code from the user prompt verbatim — do not drop it, do not modify the value.',
+          description: 'Custom metadata and channel attribution are not supported by the modern registration endpoint. Non-empty metadata is rejected instead of silently claiming attribution succeeded. Omit this field for normal setup.',
           additionalProperties: true,
         },
       },
@@ -259,10 +310,39 @@ export function buildHiAgentInstallTool(config: Required<HiOpenClawPluginConfig>
         // Step 2: build authorized clients（client_credentials 换 token）。
         const auth = await buildAuthorizedClients({ stateDir, profile: config.profile, platformBaseUrl: config.platformBaseUrl });
 
+        // Pending tokens deliberately cannot access private /me or legacy
+        // installation/delivery endpoints. Do not turn this expected state into
+        // a failed install or create another Agent to repair it.
+        if (auth.accessToken.startsWith('hi_ai_')) {
+          return asJsonResult({
+            ok: true, mode: 'registered', registered: true,
+            agent_id: state.identity?.agent_id, ready_for_public_reads: true,
+            activated: false, hooks_ready: false, push_ready: false,
+            binding_required: true, next: 'google_link',
+            summary: {connected: true, registered: true, agent_id: state.identity?.agent_id,
+              ready_for_public_reads: true, activated: false, hooks_ready: false},
+          });
+        }
+
         // Step 3: 读回 remote canonical agent_id（ensureCredential 已 register，这里应有值）。
         let me: any = null;
         try { me = await auth.gateway.me(); } catch { me = null; }
-        const registeredAgentId = String(me?.agent?.agent_id || state.identity?.agent_id || '').trim();
+        const registeredAgentId = String(me?.agent_id || me?.agent?.agent_id || state.identity?.agent_id || '').trim();
+        if (state.identity?.api_key) {
+          const bound = isVerifiedModernIdentity(me, state.identity.agent_id);
+          if (!bound) return asErrorResult('hi_identity_response_incomplete');
+          await updateState(stateDir, config.profile, cur => ({...cur, identity: cur.identity ? {
+            ...cur.identity, agent_id: registeredAgentId, anonymous: false,
+            activated_at: cur.identity.activated_at || new Date().toISOString(),
+          } : null}));
+          return asJsonResult({ok: true, mode: 'registered', registered: true,
+            agent_id: registeredAgentId, ready_for_public_reads: true, activated: true,
+            hooks_ready: false, push_ready: false,
+            warnings: ['native_delivery_not_verified'],
+            summary: {connected: true, registered: true, agent_id: registeredAgentId,
+              ready_for_public_reads: true, activated: true, hooks_ready: false},
+          });
+        }
 
         // 把 remote canonical 身份回写本地（agent_id/installation_id/activated_at）。
         const installationResp = await auth.gateway.getInstallation().catch(() => null);
@@ -418,63 +498,27 @@ export function buildHiAgentInstallTool(config: Required<HiOpenClawPluginConfig>
 
         // Step 6: post-install welcome onboarding。
         //
-        // 跟 hi-mcp-server handleInstall 完全镜像设计——native plugin 用户**没有**装任何
-        // hi 相关的 SKILL.md（OpenClaw 5.2+ 走 native plugin 路径），所以平台必须把
-        // onboarding 行为规则**直接塞进 install 工具 result**，让 LLM 不依赖外部 SKILL
-        // 也能跑 welcome 流程。这是覆盖 native plugin 主流路径的唯一同步入口。
+        // 跟 hi-mcp-server handleInstall 镜像：即使 host 未加载随包 Skills，安装结果
+        // 也要自带 onboarding 行为规则，让 welcome 流程不依赖另一个文件或请求。
         //
         // 业界 SaaS / 对话式 AI onboarding 共识（Build context, Ask intent EARLY, Show
         // populated state preview, Single clear next action）+ 我们 prod 数据观察（10 个
         // 新装 owner 里只有一半发了 friendship listing，剩下一半实际意图是招聘 / 找房 /
         // 合伙人）共同推出的引导设计。
         //
-        // 同步路径覆盖**新装**用户；**存量**用户由 platform 端 bootstrapOnboardingFanOut
-        // Worker 异步覆盖；两路 dedup 信号是 owner listing 状态（push instruction 里明确
-        // 要求收到时先调 agent_listings.list，listings.length>0 就 silently consume）。
-        //
-        // 失败 fail-soft：拉 recent_activity 的 capability 调用任何环节失败都不影响
-        // install 主流程返回 ok（welcome 是 instruction + intent_options 为核心，
-        // recent_activity 只是 populated state 增强）。welcome.recent_activity_error
-        // 字段把失败原因留给 LLM 知道。
-        let welcome:
-          | (BootstrapOnboardingPayload & { recent_activity_error?: string })
-          | null = null;
+        // 不再为欢迎卡片额外调用已下线的 hi.agent-listings/browse_recent。这个
+        // 预览不是安装成功的必要结果，额外网络请求还会拉长首次响应。新版只返回
+        // onboarding 指令和意图选项；真正的业务读写由 workspace_workflows 一次返回。
+        let welcome: BootstrapOnboardingPayload | null = null;
         try {
-          // 仅在 install 主链没出错且 hooks 配好时跑 welcome。pending Agent 已可调用
-          // 匿名公开 browse_recent；身份绑定只在私人读取或写入时需要。
+          // 仅在 install 主链没出错且 hooks 配好时返回 welcome。
           const installOk = !installationUpdateError && !hooksConfigureError;
           if (installOk) {
-            let recentActivity: RecentActivityItem[] = [];
-            let recentActivityError: string | null = null;
-            try {
-              const callResult = (await auth.platform.callCapability('hi.agent-listings', {
-                action: 'browse_recent',
-                limit: 8,
-              })) as { ok?: boolean; result?: { items?: unknown } } | undefined;
-              const items = (callResult?.result as any)?.items;
-              if (Array.isArray(items)) {
-                recentActivity = items
-                  .filter((it: any) => it && typeof it === 'object')
-                  .map((it: any) => ({
-                    listing_id: String(it.listing_id || ''),
-                    listing_type_id: String(it.listing_type_id || ''),
-                    published_by_agent_id: String(it.published_by_agent_id || ''),
-                    target_preview_text: String(it.target_preview_text || ''),
-                    listing_created_at: String(it.listing_created_at || ''),
-                  }))
-                  .filter((it: RecentActivityItem) => it.listing_id && it.target_preview_text);
-              } else {
-                recentActivityError = 'browse_recent_returned_no_items_array';
-              }
-            } catch (err: any) {
-              recentActivityError = String(err?.message || err || 'browse_recent_failed').slice(0, 240);
-            }
             welcome = {
               kind: INSTALL_WELCOME_ONBOARDING_KIND,
               instruction_to_llm: INSTALL_WELCOME_ONBOARDING_INSTRUCTION,
-              recent_activity: recentActivity,
+              recent_activity: [],
               intent_options: [...DEFAULT_INTENT_OPTIONS],
-              ...(recentActivityError ? { recent_activity_error: recentActivityError } : {}),
             };
           }
         } catch {
@@ -495,7 +539,12 @@ export function buildHiAgentInstallTool(config: Required<HiOpenClawPluginConfig>
           installation: installationUpdate,
           installation_update_error: installationUpdateError,
           subscriptions: subscriptionsResp,
-          hooks_configure: hooksConfigure,
+          hooks_configure: hooksConfigure ? {
+            hooks_path: hooksConfigure.hooks_path,
+            gateway_port: hooksConfigure.gateway_port,
+            changed: hooksConfigure.changed,
+            configured: true,
+          } : null,
           hooks_configure_error: hooksConfigureError,
           // 这台 OpenClaw 现在有一个稳定 agent，重启/开新窗口都是同一个，不会再新建。
           // 读/搜索已可用；写操作（建档/发listing/联系人/约meeting）若还没绑定身份，会被平台
@@ -588,6 +637,20 @@ export function buildHiAgentDoctorTool(config: Required<HiOpenClawPluginConfig>)
           });
         }
         const auth = await buildAuthorizedClients({ stateDir, profile: config.profile, platformBaseUrl: config.platformBaseUrl });
+        if (auth.accessToken.startsWith('hi_ai_')) {
+          return asJsonResult({ok: true, connected: true, activated: false,
+            ready_for_public_reads: true, blockers: [], warnings: ['pending_installation_public_reads_only'],
+            delivery_probe: 'not_run_pending_identity'});
+        }
+        if (state.identity.api_key) {
+          const me = await auth.gateway.me() as any;
+          const bound = isVerifiedModernIdentity(me, state.identity.agent_id);
+          return asJsonResult({ok: bound, connected: true, activated: bound,
+            ready_for_public_reads: true, push_ready: false,
+            blockers: bound ? [] : ['hi_identity_response_incomplete'],
+            warnings: ['native_delivery_not_verified'], delivery_probe: 'not_run',
+            agent_id: me.agent_id || me.agent?.agent_id || null});
+        }
         const installation = await auth.gateway.getInstallation();
         const activated = !!installation.installation?.activated_at;
         if (!activated) warnings.push('pending_installation_public_reads_only');
@@ -716,7 +779,14 @@ export function buildHiAgentResetTool(config: Required<HiOpenClawPluginConfig>):
       try {
         const file = resolveStateFile(stateDir, config.profile);
         if (args.clear_state !== false) {
+          // Only an existing persisted identity proves bootstrap completed.
+          // Unknown-outcome fences without an identity must survive reset.
+          const beforeReset = await loadStateWithQuarantine(stateDir, config.profile, config.platformBaseUrl);
           await fs.rm(file, { force: true });
+          invalidateAuthorizedClients(stateDir, config.profile);
+          if (beforeReset.identity && /^[A-Za-z0-9_-]+$/.test(config.profile)) {
+            await fs.rm(path.join(stateDir, `${config.profile}.registration-pending.json`), {force: true});
+          }
         }
         return asJsonResult({ ok: true, cleared: args.clear_state !== false, state_file: file });
       } catch (err: any) {
