@@ -14,7 +14,6 @@ const TEST_STATE_DIR = path.join(os.tmpdir(), `hi-hook-test-${process.pid}-${Dat
 
 function makeConfig(): Required<HiOpenClawPluginConfig> {
   return {
-    modernEvents: {},
     platformBaseUrl: 'https://example.invalid',
     profile: 'test',
     stateDir: TEST_STATE_DIR,

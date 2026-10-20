@@ -17,8 +17,16 @@ export function isAnonymousAccessToken(token: string): boolean {
 }
 
 const waiters = new Set<() => void>();
+// Counts signed-in tokens seen by this process. A caller reads it before its own
+// token check, so a sign-in that lands during that check is never missed.
+let signedInCount = 0;
+
+export function signInGeneration(): number {
+  return signedInCount;
+}
 
 export function notifySignedIn(): void {
+  signedInCount++;
   for (const wake of [...waiters]) wake();
 }
 
@@ -27,10 +35,12 @@ export function nextSignInWaitMs(previousMs: number): number {
   return Math.min(previousMs * 2, SIGN_IN_WAIT_MAX_MS);
 }
 
-// Resolves after `ms`, on notifySignedIn(), or when `signal` aborts.
-export function waitForSignIn(ms: number, signal?: AbortSignal): Promise<void> {
+// Resolves after `ms`, on notifySignedIn(), or when `signal` aborts. With
+// `sinceGeneration`, it resolves at once if a sign-in was seen after that point.
+export function waitForSignIn(ms: number, signal?: AbortSignal, sinceGeneration?: number): Promise<void> {
   return new Promise((resolve) => {
     if (signal?.aborted) return resolve();
+    if (sinceGeneration !== undefined && signedInCount > sinceGeneration) return resolve();
     const done = () => {
       clearTimeout(timer);
       waiters.delete(done);

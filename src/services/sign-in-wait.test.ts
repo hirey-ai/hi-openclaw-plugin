@@ -5,10 +5,11 @@ import os from 'node:os';
 import path from 'node:path';
 import { buildAgentEventsService } from './agent-events.js';
 import { buildEmptyState, writeState } from '../state.js';
-import { buildAuthorizedClients, invalidateAuthorizedClients } from '../clients.js';
+import { buildAuthorizedClients } from '../clients.js';
 import {
   nextSignInWaitMs,
   notifySignedIn,
+  signInGeneration,
   SIGN_IN_WAIT_MAX_MS,
   SIGN_IN_WAIT_MIN_MS,
   waitForSignIn,
@@ -23,6 +24,12 @@ test('the sign-in wait grows from 5 minutes to a 6-hour cap', () => {
   assert.equal(seen[0], SIGN_IN_WAIT_MIN_MS);
   assert.equal(seen[1], 2 * SIGN_IN_WAIT_MIN_MS);
   assert.equal(seen.at(-1), SIGN_IN_WAIT_MAX_MS);
+});
+
+test('a sign-in seen during the token check is not lost', async () => {
+  const before = signInGeneration();
+  notifySignedIn(); // lands while the caller is still checking its (anonymous) token
+  await waitForSignIn(60 * 60_000, undefined, before); // resolves at once
 });
 
 test('a sign-in wait ends on notifySignedIn or abort', async () => {
@@ -93,7 +100,6 @@ test('a pending legacy installation never claims and resumes once signed in', as
     // The user signs in; the next tool call's token exchange returns a signed-in
     // token, which wakes the event service.
     accessToken = 'eyJ.fixture.signedin';
-    invalidateAuthorizedClients(dir, 'fixture');
     await buildAuthorizedClients({ stateDir: dir, profile: 'fixture', platformBaseUrl: BASE });
     const deadline = Date.now() + 2_000;
     while (claims() === 0 && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 20));
