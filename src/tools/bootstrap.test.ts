@@ -89,3 +89,25 @@ test('same credential transitions pending to flat active identity without legacy
     assert.ok(await fs.stat(path.join(stateDir,'test.registration-pending.json')));
   } finally {globalThis.fetch=original;await fs.rm(stateDir,{recursive:true,force:true});}
 });
+
+test('a signed-in install reports the real /me failure instead of an incomplete identity', async()=>{
+  const stateDir=await fs.mkdtemp(path.join(os.tmpdir(),'hi-bootstrap-test-'));
+  const original=globalThis.fetch;
+  globalThis.fetch=async(url)=>{
+    const route=String(url);
+    if(route.endsWith('/.well-known/hi-agent-platform.json'))return Response.json({platform:{platform_base_url:'https://platform.test'},services:{oauth_token_url:'https://auth.test/oauth/token'}});
+    if(route.endsWith('/v1/agents/api-keys'))return Response.json({agent_id:'agt-test',status:'pending',api_key:'hi_ak_'+Buffer.from(JSON.stringify({v:1,id:'client-test',secret:'fake-test-only'})).toString('base64url')});
+    if(route.endsWith('/oauth/token'))return Response.json({access_token:'test-bound-token',token_type:'Bearer',expires_in:3600});
+    if(route.endsWith('/v1/agents/me'))return Response.json({error:'forbidden'},{status:403});
+    throw new Error(`unexpected endpoint ${route}`);
+  };
+  try {
+    const config={modernEvents:{},stateDir,profile:'test',platformBaseUrl:'https://platform.test',webhookPath:'/hi',claimPollIntervalMs:30000,claimLeaseMs:30000} as any;
+    const result=await buildHiAgentInstallTool(config).execute('test',{});
+    const body=result.structuredContent as any;
+    assert.equal(result.isError,true);
+    assert.equal(body.error,'hi_identity_check_failed');
+    assert.notEqual(body.error,'hi_identity_response_incomplete');
+    assert.match(JSON.stringify(body),/403/);
+  } finally {globalThis.fetch=original;await fs.rm(stateDir,{recursive:true,force:true});}
+});

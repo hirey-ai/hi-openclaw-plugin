@@ -326,9 +326,13 @@ export function buildHiAgentInstallTool(config: Required<HiOpenClawPluginConfig>
 
         // Step 3: 读回 remote canonical agent_id（ensureCredential 已 register，这里应有值）。
         let me: any = null;
-        try { me = await auth.gateway.me(); } catch { me = null; }
+        let meError: unknown = null;
+        try { me = await auth.gateway.me(); } catch (err) { me = null; meError = err; }
         const registeredAgentId = String(me?.agent_id || me?.agent?.agent_id || state.identity?.agent_id || '').trim();
         if (state.identity?.api_key) {
+          // Surface the real /me failure (401, 403, required upgrade, transport) so the
+          // caller can pick the right recovery; only a successful but invalid body is incomplete.
+          if (meError) return asErrorResult('hi_identity_check_failed', buildErrorDetailFields(meError));
           const bound = isVerifiedModernIdentity(me, state.identity.agent_id);
           if (!bound) return asErrorResult('hi_identity_response_incomplete');
           await updateState(stateDir, config.profile, cur => ({...cur, identity: cur.identity ? {
@@ -796,82 +800,6 @@ export function buildHiAgentResetTool(config: Required<HiOpenClawPluginConfig>):
   };
 }
 
-// ---------- hi_pull_events ----------
-// 替代 daemon claim loop：LLM 主动调一下，从平台拉一次最新 owner-actionable events。
-// 跟 OpenClaw native plugin 的 lazy/in-process 哲学一致：不开后台周期循环，而是 LLM 在
-// 用户问"有没有人发消息/匹配怎么样"时按需拉。还能让 LLM 自己控制频率，避免 OOM/socket 累积。
-export function buildHiPullEventsTool(config: Required<HiOpenClawPluginConfig>): PluginToolDefinition {
-  const stateDir = defaultStateDir(config);
-  return {
-    name: 'hi_pull_events',
-    label: 'Hi pull events',
-    description:
-      'Pull (claim) the latest owner-actionable events from the Hi platform once, ack them, and return their topics/payloads. Use this when the user asks about new Hi activity (incoming pairings, messages, meeting proposals, releases) or before deciding whether to act on a thread. Lightweight on-demand replacement for a background daemon — call it whenever fresh state is needed.',
-    parameters: {
-      type: 'object',
-      additionalProperties: false,
-      properties: {
-        limit: {
-          type: 'integer',
-          description: 'Max events to claim in one call. Default 20.',
-          default: 20,
-          minimum: 1,
-          maximum: 100,
-        },
-        lease_ms: {
-          type: 'integer',
-          description: 'Lease length to request from the platform. Default 60000.',
-          default: 60000,
-          minimum: 5000,
-          maximum: 300000,
-        },
-        ack: {
-          type: 'boolean',
-          description: 'Ack consumed events back to the platform so they will not be re-delivered. Default true.',
-          default: true,
-        },
-      },
-    },
-    async execute(_id, params): Promise<PluginToolResult> {
-      const args = (params || {}) as { limit?: number; lease_ms?: number; ack?: boolean };
-      try {
-        const auth = await buildAuthorizedClients({
-          stateDir, profile: config.profile, platformBaseUrl: config.platformBaseUrl,
-        });
-        const claim = await auth.gateway.claimEvents({
-          limit: args.limit ?? 20,
-          lease_ms: args.lease_ms ?? 60_000,
-        } as any);
-        const items = (claim?.items ?? []) as any[];
-        if (args.ack !== false && items.length > 0) {
-          try {
-            await auth.gateway.ackEvents({
-              lease_id: claim.claim_lease_id,
-              acks: items.map((ev: any) => ({ event_id: ev.event_id, status: 'consumed', stream_seq: ev.stream_seq })),
-            } as any);
-          } catch (err: any) {
-            return asJsonResult({
-              ok: true,
-              claimed: items.length,
-              items,
-              ack_error: String(err?.message || err),
-              claim_lease_id: claim.claim_lease_id ?? null,
-            });
-          }
-        }
-        return asJsonResult({
-          ok: true,
-          claimed: items.length,
-          items,
-          claim_lease_id: claim.claim_lease_id ?? null,
-        });
-      } catch (err: any) {
-        return asErrorResult('hi_pull_events_failed', buildErrorDetailFields(err));
-      }
-    },
-  };
-}
-
 // ---------- hi_agent_recover ----------
 // 跟 hi_agent_reset 是反向操作：1.0.x 之前的 quarantine 逻辑会在 issuer ↔ platform_base_url
 // origin 不同时把 state file 改名成 .stale-<host>-<ts>.bak 再 fresh register（导致旧 listings
@@ -1202,7 +1130,6 @@ export function buildAllControlTools(config: Required<HiOpenClawPluginConfig>): 
     buildHiAgentResetTool(config),
     buildHiAgentRecoverTool(config),
     buildHiAgentStateResyncTool(config),
-    buildHiPullEventsTool(config),
     buildHiAgentClaimExportTool(config),
     buildHiAgentClaimRedeemTool(config),
   ];

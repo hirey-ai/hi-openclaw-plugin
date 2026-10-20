@@ -78,7 +78,7 @@ openclaw approvals set --stdin << 'JSON'
       "allowlist": [
         {
           "pattern": "**/openclaw",
-          "argPattern": "^plugins\\s+install\\s+(clawhub:hirey|npm:@hirey-ai/hirey)(\\b|$)",
+          "argPattern": "^plugins\\s+install\\s+(clawhub:hirey|npm:@hirey-ai/hirey)(\\s|$)",
           "source": "manual"
         }
       ]

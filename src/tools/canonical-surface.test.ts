@@ -16,7 +16,7 @@ test('OpenClaw manifest exposes only current platform capabilities plus local co
   const expected = new Set([
     'hi_agent_status', 'hi_agent_install', 'hi_agent_doctor', 'hi_agent_reset',
     'hi_agent_recover', 'hi_agent_state_resync', 'hi_agent_claim_export',
-    'hi_agent_claim_redeem', 'hi_pull_events',
+    'hi_agent_claim_redeem',
     'email_binding', 'google_link', 'phone_binding', 'workspace_workflows',
   ]);
   assert.deepEqual(new Set(manifest.contracts?.tools), expected);
