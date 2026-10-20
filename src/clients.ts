@@ -23,6 +23,7 @@ import {
 } from './state.js';
 import { PLUGIN_VERSION } from './version.js';
 import { bootstrapPendingAgent } from './bootstrap.js';
+import { isAnonymousAccessToken, notifySignedIn } from './services/sign-in-wait.js';
 import {createHash} from 'node:crypto';
 
 export type HiAuthorizedClients = {
@@ -285,6 +286,8 @@ async function buildAuthorizedClientsUncached(args: {
     }
     throw err;
   }
+  // A signed-in token ends any event-service wait for sign-in in this process.
+  if (!isAnonymousAccessToken(token.access_token)) notifySignedIn();
   const wellKnown = discovered.wellKnown;
   const clientOptions = {token: token.access_token, fetchImpl: contextualFetch};
   const platform = new HiAgentPlatformClient({...clientOptions,
@@ -298,7 +301,7 @@ async function buildAuthorizedClientsUncached(args: {
     platform,
     wellKnown,
     quarantined: peekQuarantineNotice(),
-    expiresAt: tokenReceivedAt + Math.min(token.access_token.startsWith('hi_ai_') ? 10_000 : 60_000,
+    expiresAt: tokenReceivedAt + Math.min(isAnonymousAccessToken(token.access_token) ? 10_000 : 60_000,
       Math.max(0, Number(token.expires_in || 0) * 1000 - 30_000)),
   };
 }

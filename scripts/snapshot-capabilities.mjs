@@ -58,7 +58,6 @@ const STATIC_LOCAL_TOOLS = [
   'hi_agent_state_resync',
   'hi_agent_claim_export',
   'hi_agent_claim_redeem',
-  'hi_pull_events',
 ];
 
 const CHECK_ONLY = process.argv.includes('--check');

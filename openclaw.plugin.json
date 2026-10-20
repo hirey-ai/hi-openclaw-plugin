@@ -23,7 +23,6 @@
       "hi_agent_state_resync",
       "hi_agent_claim_export",
       "hi_agent_claim_redeem",
-      "hi_pull_events",
       "email_binding",
       "google_link",
       "phone_binding",

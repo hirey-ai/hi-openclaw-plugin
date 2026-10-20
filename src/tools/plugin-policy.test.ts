@@ -24,7 +24,7 @@ test('OpenClaw reports its host and installed version when reading release polic
   try {
     const policy = await fetchPluginReleasePolicy('https://hi.hirey.ai/');
     assert.equal(observedHeaders?.get('x-hirey-plugin-host'), 'openclaw');
-    assert.equal(observedHeaders?.get('x-hirey-plugin-version'), '1.0.75');
+    assert.equal(observedHeaders?.get('x-hirey-plugin-version'), '1.0.76');
     assert.ok(observedSignal instanceof AbortSignal);
     assert.equal(policy?.host, 'openclaw');
     assert.equal(policy?.update_required, false);
