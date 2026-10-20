@@ -9,6 +9,7 @@ import { buildAuthorizedClients } from '../clients.js';
 import {
   nextSignInWaitMs,
   notifySignedIn,
+  signInGeneration,
   SIGN_IN_WAIT_MAX_MS,
   SIGN_IN_WAIT_MIN_MS,
   waitForSignIn,
@@ -23,6 +24,12 @@ test('the sign-in wait grows from 5 minutes to a 6-hour cap', () => {
   assert.equal(seen[0], SIGN_IN_WAIT_MIN_MS);
   assert.equal(seen[1], 2 * SIGN_IN_WAIT_MIN_MS);
   assert.equal(seen.at(-1), SIGN_IN_WAIT_MAX_MS);
+});
+
+test('a sign-in seen during the token check is not lost', async () => {
+  const before = signInGeneration();
+  notifySignedIn(); // lands while the caller is still checking its (anonymous) token
+  await waitForSignIn(60 * 60_000, undefined, before); // resolves at once
 });
 
 test('a sign-in wait ends on notifySignedIn or abort', async () => {

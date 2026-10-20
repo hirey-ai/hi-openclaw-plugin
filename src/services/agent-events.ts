@@ -37,6 +37,7 @@ import { isPushInjectionActive } from './push-injection-state.js';
 import {
   isAnonymousAccessToken,
   nextSignInWaitMs,
+  signInGeneration,
   SIGN_IN_REQUIRED_LOG,
   waitForSignIn,
 } from './sign-in-wait.js';
@@ -465,6 +466,7 @@ export function buildAgentEventsService(
         let backoffMs = RECONNECT_BASE_MS;
         let signInWaitMs = 0;
         while (!stopped) {
+          const generation = signInGeneration();
           const ready = await isReady();
           if (!ready.auth || !ready.rt) {
             await sleep(IDLE_BACKOFF_MS);
@@ -475,7 +477,7 @@ export function buildAgentEventsService(
             // claim or open the stream until the user signs in (see sign-in-wait.ts).
             if (signInWaitMs === 0) logger.warn?.(SIGN_IN_REQUIRED_LOG);
             signInWaitMs = nextSignInWaitMs(signInWaitMs);
-            await waitForSignIn(signInWaitMs, abort.signal);
+            await waitForSignIn(signInWaitMs, abort.signal, generation);
             continue;
           }
           signInWaitMs = 0;
