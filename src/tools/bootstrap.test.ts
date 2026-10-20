@@ -66,7 +66,7 @@ test('same credential transitions pending to flat active identity without legacy
     if(route.endsWith('/.well-known/hi-agent-platform.json'))return Response.json({platform:{platform_base_url:'https://platform.test'},services:{oauth_token_url:'https://auth.test/oauth/token'}});
     if(route.endsWith('/v1/agents/api-keys')){posts++;return Response.json({agent_id:'agt-test',status:'pending',api_key:'hi_ak_'+Buffer.from(JSON.stringify({v:1,id:'client-test',secret:'fake-test-only'})).toString('base64url')});}
     if(route.endsWith('/oauth/token')){assert.ok(init?.signal);exchanges++;return Response.json({access_token:active?'test-bound-token':'hi_ai_test-pending',token_type:'Bearer',expires_in:3600});}
-    if(route.endsWith('/v1/agents/me')){assert.equal(active,true);assert.equal(new Headers(init?.headers).get('x-hirey-plugin-host'),'openclaw');assert.equal(new Headers(init?.headers).get('x-hirey-plugin-version'),'1.0.75');return Response.json({agent_id:'agt-test',person_id:'per-test',workspace_id:'ws-test',agent_session_id:'session-test'});}
+    if(route.endsWith('/v1/agents/me')){assert.equal(active,true);assert.equal(new Headers(init?.headers).get('x-hirey-plugin-host'),'openclaw');assert.equal(new Headers(init?.headers).get('x-hirey-plugin-version'),'1.0.76');return Response.json({agent_id:'agt-test',person_id:'per-test',workspace_id:'ws-test',agent_session_id:'session-test'});}
     throw new Error(`unexpected endpoint ${route}`);
   };
   try {

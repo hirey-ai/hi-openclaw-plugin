@@ -28,7 +28,7 @@ function mockNetwork(delay = 0) {
     calls.push(call);
     const headers = new Headers(init?.headers);
     assert.equal(headers.get('x-hirey-plugin-host'), 'openclaw');
-    assert.equal(headers.get('x-hirey-plugin-version'), '1.0.75');
+    assert.equal(headers.get('x-hirey-plugin-version'), '1.0.76');
     if (delay) await new Promise(resolve => setTimeout(resolve, delay));
     call.end = performance.now();
     let body: unknown;

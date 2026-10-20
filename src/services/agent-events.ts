@@ -35,6 +35,12 @@ import { streamAgentEvents } from '@hirey/hi-agent-sdk';
 import { appendPendingPush } from './pending-pushes.js';
 import { isPushInjectionActive } from './push-injection-state.js';
 import { runModernEventReceiver } from './modern-agent-events.js';
+import {
+  isAnonymousAccessToken,
+  nextSignInWaitMs,
+  SIGN_IN_REQUIRED_LOG,
+  waitForSignIn,
+} from './sign-in-wait.js';
 import path from 'node:path';
 import fs from 'node:fs/promises';
 
@@ -317,6 +323,7 @@ export function buildAgentEventsService(
         activeAbort = abort;
         const signal = ctx.signal ? AbortSignal.any([abort.signal, ctx.signal]) : abort.signal;
         let runtime: DaemonRuntimeConfig | null = null;
+        let signInWaitMs = 0;
         void runModernEventReceiver({
           platformBaseUrl: config.platformBaseUrl,
           signal,
@@ -332,7 +339,14 @@ export function buildAgentEventsService(
             runtime = await __testing_readModernHooksConfig();
             if (!runtime) return null;
             const auth = await buildAuthorizedClients({ stateDir, profile: config.profile, platformBaseUrl: config.platformBaseUrl });
-            if (auth.accessToken.startsWith('hi_ai_')) return null;
+            if (isAnonymousAccessToken(auth.accessToken)) {
+              // Not signed in: claiming cannot succeed. Wait instead of exchanging a token every cycle.
+              if (signInWaitMs === 0) logger.warn?.(SIGN_IN_REQUIRED_LOG);
+              signInWaitMs = nextSignInWaitMs(signInWaitMs);
+              await waitForSignIn(signInWaitMs, signal);
+              return null;
+            }
+            signInWaitMs = 0;
             return { token: auth.accessToken };
           },
           deliver: async (event, deliverySignal) => {
@@ -551,12 +565,22 @@ export function buildAgentEventsService(
       // 主循环：drain → SSE → drain → SSE …
       const runMainLoop = async () => {
         let backoffMs = RECONNECT_BASE_MS;
+        let signInWaitMs = 0;
         while (!stopped) {
           const ready = await isReady();
           if (!ready.auth || !ready.rt) {
             await sleep(IDLE_BACKOFF_MS);
             continue;
           }
+          if (isAnonymousAccessToken(ready.auth.accessToken)) {
+            // A pending Agent's claim always gets 401 agent_sign_in_required. Do not
+            // claim or open the stream until the user signs in (see sign-in-wait.ts).
+            if (signInWaitMs === 0) logger.warn?.(SIGN_IN_REQUIRED_LOG);
+            signInWaitMs = nextSignInWaitMs(signInWaitMs);
+            await waitForSignIn(signInWaitMs, abort.signal);
+            continue;
+          }
+          signInWaitMs = 0;
           try {
             await drainBacklog(ready.auth, ready.rt);
             backoffMs = RECONNECT_BASE_MS;
