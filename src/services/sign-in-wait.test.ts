@@ -5,7 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { buildAgentEventsService } from './agent-events.js';
 import { buildEmptyState, writeState } from '../state.js';
-import { buildAuthorizedClients, invalidateAuthorizedClients } from '../clients.js';
+import { buildAuthorizedClients } from '../clients.js';
 import {
   nextSignInWaitMs,
   notifySignedIn,
@@ -93,7 +93,6 @@ test('a pending legacy installation never claims and resumes once signed in', as
     // The user signs in; the next tool call's token exchange returns a signed-in
     // token, which wakes the event service.
     accessToken = 'eyJ.fixture.signedin';
-    invalidateAuthorizedClients(dir, 'fixture');
     await buildAuthorizedClients({ stateDir: dir, profile: 'fixture', platformBaseUrl: BASE });
     const deadline = Date.now() + 2_000;
     while (claims() === 0 && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 20));

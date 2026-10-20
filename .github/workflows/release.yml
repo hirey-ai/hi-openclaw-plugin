@@ -31,6 +31,11 @@ on:
         description: "已完成验收、准备发布的 package.json 版本（例如 1.0.75）"
         required: true
         type: string
+      candidate:
+        description: "Candidate: publish to ClawHub only under tag `candidate` (latest unchanged, npm skipped) to read its ClawHub scan before a latest release"
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -83,7 +88,7 @@ jobs:
 
   publish-npm:
     needs: detect-bump
-    if: needs.detect-bump.outputs.bumped == 'true'
+    if: needs.detect-bump.outputs.bumped == 'true' && !inputs.candidate
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -249,6 +254,7 @@ jobs:
           VERSION: ${{ needs.detect-bump.outputs.version }}
           SHA: ${{ needs.detect-bump.outputs.sha }}
           CHANGELOG: ${{ needs.detect-bump.outputs.changelog }}
+          TAGS: ${{ inputs.candidate && 'candidate' || 'latest' }}
         run: |
           cd "${RUNNER_TEMP}/staging/package"
           clawhub --no-input package publish . \
@@ -261,14 +267,20 @@ jobs:
             --source-repo hirey-ai/hi-openclaw-plugin \
             --source-commit "$SHA" \
             --source-ref main \
-            --tags latest
+            --tags "$TAGS"
 
       - name: Verify ClawHub registry shows new version
         env:
           EXPECTED: ${{ needs.detect-bump.outputs.version }}
+          CANDIDATE: ${{ inputs.candidate }}
         run: |
-          for i in {1..30}; do
-            got=$(clawhub package inspect hirey --json 2>/dev/null | jq -r '.package.latestVersion // empty')
+          # ClawHub can take ~10 minutes to surface a release; wait up to 15.
+          for i in {1..90}; do
+            if [[ "$CANDIDATE" == "true" ]]; then
+              got=$(clawhub package inspect hirey --tag candidate --json 2>/dev/null | jq -r '.version.version // empty')
+            else
+              got=$(clawhub package inspect hirey --json 2>/dev/null | jq -r '.package.latestVersion // empty')
+            fi
             if [[ "$got" == "$EXPECTED" ]]; then
               echo "ClawHub clawhub:hirey@$EXPECTED visible (attempt $i)"
               exit 0
@@ -276,7 +288,7 @@ jobs:
             echo "Attempt $i: clawhub inspect returned '$got', want '$EXPECTED'; retrying..."
             sleep 10
           done
-          echo "ERROR: ClawHub did not surface clawhub:hirey@$EXPECTED within 5min" >&2
+          echo "ERROR: ClawHub did not surface clawhub:hirey@$EXPECTED within 15min" >&2
           exit 1
 
   release-summary:
